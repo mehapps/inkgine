@@ -1,0 +1,30 @@
+# Example compose service. Build first:  docker build -t inkgine -f deploy/Dockerfile deploy
+# Run from the repo root:                docker compose -f deploy/compose.example.yaml up -d
+# Paths resolve against this file's dir. Set MODEL_DIR to your checkpoint.
+services:
+  inkgine:
+    image: inkgine
+    gpus: all
+    user: "${UID:-1000}:${GID:-1000}"
+    ports: ["127.0.0.1:30000:30000"]
+    environment:
+      INK_HOST: 0.0.0.0          # inside the container; the host side is published on 127.0.0.1 only
+      INK_PORT: "30000"
+      INK_MODEL: /models/inkling
+      INK_CACHE_DIR: /inkcache
+      INK_CACHE_GB: "200"
+      INK_MAX_CTX: "1048576"
+      HOME: /cache/home          # Triton/inductor/zig JIT caches persist across restarts
+      XDG_CACHE_HOME: /cache
+      TRITON_CACHE_DIR: /cache/triton
+      TORCHINDUCTOR_CACHE_DIR: /cache/inductor
+    volumes:
+      - ..:/app:ro
+      - ${MODEL_DIR:?set MODEL_DIR}:/models/inkling:ro
+      - ./inkcache:/inkcache
+      - ./jit-cache:/cache
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request as u; assert json.load(u.urlopen('http://127.0.0.1:30000/health', timeout=5))['ok']"]
+      interval: 15s
+      start_period: 900s
+    restart: unless-stopped

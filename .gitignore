@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+# internal / host-local (kept out of the public repo)
+NOTES.md
+/data/
+evals-*.json
+deploy/*
+!deploy/Dockerfile
+!deploy/requirements.lock
+!deploy/compose.example.yaml
