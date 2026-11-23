@@ -1,4 +1,4 @@
-.venv/
+.venv
 __pycache__/
 *.pyc
 # internal / host-local (kept out of the public repo)
