@@ -9,6 +9,9 @@ PyTorch + Triton for one RTX 5090 (sm_120, 32 GB). It serves an OpenAI-compatibl
 - Continuous batching with priority queueing and preemption
 - CUDA-graph decode, fused decode kernels, DSpark / prompt-lookup speculative decoding
 
+Speed on one 5090: ~145 tok/s single-stream decode at short context (~296 tok/s on code with DSpark), 73-80 tok/s at
+1M, 1M-token prefill in ~6.5 min. Full numbers in [BENCHMARKS.md](BENCHMARKS.md).
+
 Status: runs in production on one machine. Tuned for one GPU model; expect work to run elsewhere.
 
 ## Run
