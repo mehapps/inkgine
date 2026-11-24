@@ -1,7 +1,8 @@
 # inkgine
 
 A single-GPU inference server for [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), written in
-PyTorch + Triton for one RTX 5090 (sm_120, 32 GB). It serves an OpenAI-compatible API.
+PyTorch + Triton for one RTX 5090 (sm_120, 32 GB). It serves an OpenAI-compatible API: `/v1/chat/completions` and a
+stateless `/v1/responses` (the whole conversation in `input`; no `previous_response_id` or stored responses).
 
 - Text + full-resolution images, tool calls, reasoning effort, `json_schema` (xgrammar), streaming
 - Up to 1M tokens of context (paged 4-bit KV)

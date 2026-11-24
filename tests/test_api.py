@@ -311,7 +311,8 @@ for seed in range(12):
     choice = 'required' if seed % 2 else {'type': 'function', 'function': {'name': 'get_weather'}}
     think, par = seed % 3 == 0, seed % 4 < 2
     c, p, ids = tool_run(choice, think, par, seed)
-    assert len(p.tool_calls) == 1 and c.done == (not par), (p.tool_calls, c.state)
+    named = isinstance(choice, dict)  # (a named function: one call, whatever parallel_tool_calls says)
+    assert len(p.tool_calls) == 1 and c.done == (not par or named), (p.tool_calls, c.state)
     call = p.tool_calls[0]
     args = json.loads(call['arguments'])
     assert call['name'] in ('get_weather', 'get_time') and (seed % 2 or call['name'] == 'get_weather'), call
@@ -876,4 +877,420 @@ for bad in (dict(n=0), dict(n=9), dict(top_logprobs=2), dict(logprobs=True, top_
             dict(tools=TOOLS, tool_choice='required', response_format={'type': 'json_object'})):
     assert post(**bad).status_code == 400, bad
 print('6 server: n (choices, seed + i, usage once/summed, streamed indexes), logprobs fields, params, 400s')
+
+# 6b. reasoning_tokens: the thinking block's body + its END (not the MODEL / THINK header, not the answer)
+r, _ = mkreq(E, max_tokens=50)
+r.t1 = 0
+a, b = enc('hm ok')[:2]
+for t in (chat.MODEL, chat.THINK, a, b, chat.END, chat.MODEL, chat.TEXT, a, chat.END, chat.EOS):
+    E._feed(r, t)
+assert r.stats['reasoning_tokens'] == 3 and r.stats['completion_tokens'] == 10, r.stats
+assert post().json()['usage']['completion_tokens_details'] == {'reasoning_tokens': 0}  # (the fake engine: no thinking)
+print('6b reasoning_tokens counted (thinking body + END), in chat usage')
+
+# 7. /v1/responses (stateless) ---------------------------------------------------------------------------------------
+# 7a. request mapping, on what LiteLLM's Anthropic /v1/messages bridge sends: a 2-turn tool loop with thinking + image
+IMG = 'data:image/png;base64,AAAA'
+rb = dict(model='m', instructions='be brief', max_output_tokens=50, reasoning={'effort': 'low'}, parallel_tool_calls=False,
+          include=['reasoning.encrypted_content'], store=False, prompt_cache_key='k', user='u', priority=3,
+          tools=[{'type': 'web_search_preview'}, {'type': 'function', 'name': 'get_time', 'strict': False,
+                                                  'description': 'd', 'parameters': {'type': 'object'}}],
+          tool_choice={'type': 'function', 'name': 'get_time'},
+          text={'format': {'type': 'json_schema', 'name': 'o', 'schema': {'type': 'object'}, 'strict': False}},
+          input=[{'type': 'message', 'role': 'developer', 'content': [{'type': 'input_text', 'text': 'dev'}]},
+                 {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'time?',
+                                                                 'prompt_cache_breakpoint': {}},
+                                                                {'type': 'input_image', 'image_url': IMG}]},
+                 {'type': 'reasoning', 'summary': [{'type': 'summary_text', 'text': 'think'}], 'encrypted_content': 'x'},
+                 {'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'checking'}]},
+                 {'type': 'function_call', 'call_id': 'c1', 'name': 'get_time', 'arguments': '{"tz":"ET"}'},
+                 {'type': 'function_call_output', 'call_id': 'c1', 'output': '9am'},
+                 {'type': 'message', 'role': 'system', 'content': [{'type': 'input_text', 'text': 'mid'}]},
+                 {'type': 'reasoning', 'summary': [{'type': 'summary_text', 'text': 'again'}]},
+                 {'type': 'function_call', 'call_id': 'c2', 'name': 'get_time', 'arguments': ''},
+                 {'type': 'message', 'role': 'assistant', 'content': 'after the call: a new turn'},
+                 {'type': 'function_call_output', 'call_id': 'c2',
+                  'output': [{'type': 'input_text', 'text': 'img:'}, {'type': 'input_image', 'image_url': IMG}]}])
+cb = server.resp_to_chat(rb)
+assert cb['messages'] == [
+    {'role': 'system', 'content': 'be brief'},
+    {'role': 'developer', 'content': [{'type': 'text', 'text': 'dev'}]},
+    {'role': 'user', 'content': [{'type': 'text', 'text': 'time?'}, {'type': 'image_url', 'image_url': IMG}]},
+    {'role': 'assistant', 'content': 'checking', 'reasoning_content': 'think', 'tool_calls': [
+        {'id': 'c1', 'type': 'function', 'function': {'name': 'get_time', 'arguments': '{"tz":"ET"}'}}]},
+    {'role': 'tool', 'tool_call_id': 'c1', 'content': '9am'},
+    {'role': 'system', 'content': [{'type': 'text', 'text': 'mid'}]},
+    {'role': 'assistant', 'content': '', 'reasoning_content': 'again', 'tool_calls': [
+        {'id': 'c2', 'type': 'function', 'function': {'name': 'get_time', 'arguments': '{}'}}]},
+    {'role': 'assistant', 'content': 'after the call: a new turn'},
+    {'role': 'tool', 'tool_call_id': 'c2', 'content': [{'type': 'text', 'text': 'img:'},
+                                                       {'type': 'image_url', 'image_url': IMG}]}], cb['messages']
+assert cb['tools'] == [{'type': 'function', 'function': {'name': 'get_time', 'description': 'd',
+                                                         'parameters': {'type': 'object'}}}]  # hosted tool dropped
+assert cb['tool_choice'] == {'type': 'function', 'function': {'name': 'get_time'}} and cb['max_tokens'] == 50
+assert cb['response_format']['json_schema']['schema'] == {'type': 'object'} and cb['reasoning_effort'] == 'low'
+assert cb['priority'] == 3 and cb['parallel_tool_calls'] is False and 'include' not in cb and 'store' not in cb
+ids = chat.render(tok, cb['messages'], cb['tools'], effort=0.2, image_tokens=lambda p: 2)  # renders (chat's path)
+assert ids.count(chat.IMG_TOK) == 4 and ids.count(chat.INVOKE_JSON) == 2 and ids.count(chat.THINK) == 2
+assert server.resp_to_chat(dict(input='hi'))['messages'] == [{'role': 'user', 'content': 'hi'}]
+assert server.resp_to_chat(dict(input='hi', text={'format': {'type': 'json_object'}}))['response_format'] == \
+    {'type': 'json_object'}
+
+# 7b. output items and stream events (RespOut): reasoning (raw content; no summary unless asked), text, then the calls
+o = server.RespOut()
+evs = o.delta('reasoning', 'a') + o.delta('reasoning', 'b') + o.delta('content', '') + o.delta('content', 'x') + \
+    o.delta('content', 'y') + o.call('call_end', {'name': 'f', 'arguments': '{"q":1}'})  # (a call parsed at its END)
+assert [i['type'] for i in o.items] == ['reasoning', 'message', 'function_call']
+assert o.items[0]['summary'] == [] and o.items[0]['content'] == [{'type': 'reasoning_text', 'text': 'ab'}]
+assert 'encrypted_content' not in o.items[0]
+assert o.items[1]['content'][0]['text'] == 'xy' and o.items[1]['status'] == 'completed'
+assert o.items[2]['arguments'] == '{"q":1}' and o.items[2]['call_id'].startswith('call_')
+assert [e['type'] for e in evs] == [
+    'response.output_item.added', 'response.content_part.added', 'response.reasoning_text.delta',
+    'response.reasoning_text.delta', 'response.reasoning_text.done',
+    'response.content_part.done', 'response.output_item.done',
+    'response.output_item.added', 'response.content_part.added', 'response.output_text.delta',
+    'response.output_text.delta', 'response.output_text.done', 'response.content_part.done',
+    'response.output_item.done', 'response.output_item.added', 'response.function_call_arguments.delta',
+    'response.function_call_arguments.done', 'response.output_item.done']
+assert [e['output_index'] for e in evs] == [0] * 7 + [1] * 7 + [2] * 4
+assert evs[0]['item']['summary'] == [] and evs[7]['item']['content'] == [] and evs[14]['item']['arguments'] == ''
+# summary asked for (the same full text: no summarizer) + encrypted_content, and its round trip into the next turn
+o = server.RespOut(summary=True, enc=True)
+evs = o.delta('reasoning', 'thinking ') + o.delta('reasoning', 'é🚀') + o.close()
+rs = o.items[0]
+assert rs['summary'] == [{'type': 'summary_text', 'text': 'thinking é🚀'}] and rs['content'][0]['text'] == 'thinking é🚀'
+assert rs['encrypted_content'].startswith('ink1:') and server.dec_reasoning(rs['encrypted_content']) == 'thinking é🚀'
+types = [e['type'] for e in evs]
+assert types.count('response.reasoning_text.delta') == 2 and types.count('response.reasoning_summary_text.delta') == 2
+nxt = server.resp_to_chat(dict(input=[{'role': 'user', 'content': 'q'},
+                                      {'type': 'reasoning', 'summary': [{'type': 'summary_text', 'text': 'short'}],
+                                       'encrypted_content': rs['encrypted_content']},  # (ours wins over the summary)
+                                      {'type': 'reasoning', 'summary': [], 'encrypted_content': 'gAAAA-other-model'},
+                                      {'type': 'function_call', 'call_id': 'c', 'name': 'f', 'arguments': '{}'}]))
+assert nxt['messages'][1]['reasoning_content'] == 'thinking é🚀', nxt['messages']
+assert server.resp_to_chat(dict(input=[{'type': 'reasoning', 'content': [{'type': 'reasoning_text', 'text': 'raw'}],
+                                        'summary': [{'type': 'summary_text', 'text': 's'}]}, {'role': 'user', 'content': 'q'}])
+                           )['messages'][0]['reasoning_content'] == 'raw'  # (raw content beats the summary)
+try:
+    server.resp_to_chat(dict(input=[{'type': 'reasoning', 'encrypted_content': 'ink1:@@@'}, {'role': 'user', 'content': 'q'}]))
+    raise AssertionError('bad ink1 accepted')
+except server.BadRequest:
+    pass
+
+# 7c. the endpoint (fake engine: 'ok' content tokens; tool calls via the stats)
+fake = dict(calls=[], prompt='ok:1:2', stream=False)
+
+
+def fake_tok(self, r):  # after the text: the calls as the parser emits them (whole, or streamed in 3 pieces)
+    FakeEngine._tok(self, r)
+    for c in (r.stats.get('tool_calls') or []) if r.done else []:
+        if fake['stream']:
+            a = c['arguments']
+            r.emit('delta', ('call_start', c['name']))
+            for piece in (a[:3], a[3:7], a[7:]):
+                r.emit('delta', ('call_args', piece))
+        r.emit('delta', ('call_end', c))
+
+
+Fake._tok = fake_tok
+
+
+def fake_request(self, messages, **kw):
+    seen.append({k: v for k, v in kw.items() if k not in ('stats', 'emit', 'prio', 'cancel')})
+    kw['stats']['tool_calls'] = list(fake['calls'])
+    return FakeEngine.request(self, [{'content': fake['prompt']}], **{k: kw[k] for k in ('stats', 'emit', 'prio', 'cancel')})
+
+
+Fake.request = fake_request
+rpost = lambda **kw: c.post('/v1/responses', json=dict(dict(model='m', input='hi'), **kw))
+r = rpost(max_output_tokens=7).json()
+assert r['object'] == 'response' and r['status'] == 'completed' and r['id'].startswith('resp_'), r
+assert [i['type'] for i in r['output']] == ['message'] and r['output'][0]['content'][0]['text'] == 'ok0 ok1 '
+assert r['usage']['input_tokens'] == 1 and r['usage']['output_tokens'] == 2 and seen[-1]['max_tokens'] == 7
+fake['calls'] = [{'name': 'get_time', 'arguments': '{}'}]
+s = rpost(stream=True, tools=[{'type': 'function', 'name': 'get_time', 'parameters': {'type': 'object'}}]).text
+fake['calls'] = []
+evs = [json.loads(x.split('data: ', 1)[1]) for x in s.split('\n\n') if 'data: ' in x]
+assert [e['sequence_number'] for e in evs] == list(range(len(evs)))
+assert all(f'event: {e["type"]}\n' in s for e in evs)
+assert evs[0]['type'] == 'response.created' and evs[0]['response']['status'] == 'in_progress'
+assert ''.join(e['delta'] for e in evs if e['type'] == 'response.output_text.delta') == 'ok0 ok1 '
+assert evs[-1]['type'] == 'response.completed' and [i['type'] for i in evs[-1]['response']['output']] == \
+    ['message', 'function_call'] and evs[-1]['response']['usage']['output_tokens'] == 2
+fake['prompt'] = 'oom:1:1'  # engine error: 503 / response.failed
+assert rpost().status_code == 503
+evs = [json.loads(x.split('data: ', 1)[1]) for x in rpost(stream=True).text.split('\n\n') if 'data: ' in x]
+assert evs[-1]['type'] == 'response.failed' and evs[-1]['response']['error']['code'] == 'server_is_overloaded', evs
+fake['prompt'] = 'ok:1:2'
+for bad in (dict(previous_response_id='resp_x'), dict(input=[]), dict(input=5), dict(truncation='middle'),
+            dict(input=[{'type': 'item_reference', 'id': 'x'}]), dict(background=True),
+            dict(input=[{'role': 'user', 'content': [{'type': 'input_file', 'file_data': 'x'}]}]),
+            dict(input=[{'role': 'user', 'content': [{'type': 'input_image', 'file_id': 'f'}]}]),
+            dict(tool_choice={'type': 'web_search_preview'}), dict(reasoning={'effort': 'huge'}),
+            dict(tools=[{'type': 'custom', 'name': 'x', 'format': {'type': 'grammar', 'syntax': 'ebnf'}}])):
+    assert rpost(**bad).status_code == 400, bad
+print('7 /v1/responses: request mapping (bridge-shaped tool loop, images, reasoning), items + events, stream, 400s')
+
+# 8. custom tools (chat + Responses), allowed_tools, logprobs, content parts the model can't take ----------------------
+CT = {'type': 'custom', 'custom': {'name': 'patch', 'description': 'apply a patch',
+                                   'format': {'type': 'grammar', 'syntax': 'regex', 'definition': '^[a-z]+-[0-9]{2}$'}}}
+CL = {'type': 'custom', 'custom': {'name': 'sql', 'format': {'type': 'grammar', 'syntax': 'lark', 'definition': 'start: "SELECT"'}}}
+FN = {'type': 'function', 'function': {'name': 'get_time', 'parameters': {'type': 'object'}}}
+tools, choice, custom = server.chat_tools(dict(tools=[CT, CL, FN, {'type': 'custom', 'custom': {'name': 'free'}}]))
+assert custom == {'patch', 'sql', 'free'} and choice == 'auto' and tools[2] is FN
+assert tools[0]['function']['parameters'] == {'type': 'object', 'required': ['input'], 'properties': {
+    'input': {'type': 'string', 'pattern': '^[a-z]+-[0-9]{2}$'}}} and tools[0]['function']['description'] == 'apply a patch'
+assert 'start: "SELECT"' in tools[1]['function']['description'] and 'pattern' not in str(tools[3])
+f = grammar.compile_tools(tok, tools[:1], 'required', think=False)  # the regex holds the call's input
+
+
+def call_ok(inp):
+    m = grammar.xgr.GrammarMatcher(f.compiled['patch'])
+    return m.accept_string(chat.call_body('patch', {'input': inp})) and m.is_completed()
+
+
+assert not f.lazy and call_ok('ab-12') and not call_ok('AB-1x') and not call_ok('ab-123')
+t2, c2, _ = server.chat_tools(dict(tools=[CT, FN], tool_choice={'type': 'allowed_tools', 'allowed_tools': {
+    'mode': 'required', 'tools': [{'type': 'function', 'function': {'name': 'get_time'}}]}}))
+assert t2 == [FN] and c2 == 'required'  # only the allowed tools are rendered
+assert server.chat_tools(dict(tools=[CT], tool_choice={'type': 'custom', 'custom': {'name': 'patch'}}))[1] == \
+    {'type': 'function', 'function': {'name': 'patch'}}
+assert server.chat_tools(dict(tools=[CT], tool_choice='none')) == (None, 'none', set())
+m = server.chat_messages([{'role': 'assistant', 'content': '', 'tool_calls': [
+    {'id': 'a', 'type': 'custom', 'custom': {'name': 'patch', 'input': 'ab-12'}}, dict(id='b', type='function', function={
+        'name': 'get_time', 'arguments': '{}'})]}])[0]['tool_calls']
+assert m[0] == {'id': 'a', 'type': 'function', 'function': {'name': 'patch', 'arguments': '{"input": "ab-12"}'}} and m[1]['id'] == 'b'
+assert server.custom_input({'name': 'patch', 'arguments': '{"input": "ab-12"}'}) == 'ab-12'
+# chat endpoint: a custom call goes out as type custom
+fake['calls'] = [{'name': 'patch', 'arguments': '{"input": "ab-12"}'}]
+r = post(tools=[CT]).json()['choices'][0]
+assert r['message']['tool_calls'][0]['type'] == 'custom' and r['message']['tool_calls'][0]['custom'] == \
+    {'name': 'patch', 'input': 'ab-12'} and r['finish_reason'] == 'tool_calls', r
+s = post(tools=[CT], stream=True).text
+tc = [json.loads(x[6:]) for x in s.split('\n\n') if x.startswith('data: {') and '"tool_calls"' in x][0]
+assert tc['choices'][0]['delta']['tool_calls'][0]['custom']['input'] == 'ab-12'
+# Responses: custom tool in, custom_tool_call out (with its stream events), custom history items mapped
+rt = {'type': 'custom', 'name': 'patch', 'format': {'type': 'grammar', 'syntax': 'regex', 'definition': '^x$'}}
+cb = server.resp_to_chat(dict(tools=[rt, {'type': 'function', 'name': 'get_time'}, {'type': 'file_search'}],
+                              tool_choice={'type': 'allowed_tools', 'mode': 'auto', 'tools': [{'type': 'custom', 'name': 'patch'}]},
+                              include=['message.output_text.logprobs'], top_logprobs=3, input=[
+    {'type': 'message', 'role': 'user', 'content': 'go'},
+    {'type': 'custom_tool_call', 'call_id': 'c', 'name': 'patch', 'input': 'x'},
+    {'type': 'custom_tool_call_output', 'call_id': 'c', 'output': 'done'}]))
+assert cb['tools'][0] == {'type': 'custom', 'custom': {'name': 'patch', 'format': rt['format']}} and len(cb['tools']) == 2
+assert cb['tool_choice'] == {'type': 'allowed_tools', 'allowed_tools': {'mode': 'auto', 'tools': [
+    {'type': 'custom', 'custom': {'name': 'patch'}}]}} and cb['logprobs'] is True and cb['top_logprobs'] == 3
+assert cb['messages'][1]['tool_calls'] == [{'id': 'c', 'type': 'custom', 'custom': {'name': 'patch', 'input': 'x'}}]
+assert cb['messages'][2] == {'role': 'tool', 'tool_call_id': 'c', 'content': 'done'}
+assert server.chat_tools(cb)[0] == [server.chat_tools(dict(tools=[cb['tools'][0]]))[0][0]]  # allowed: patch only
+s = rpost(stream=True, tools=[rt]).text
+evs = [json.loads(x.split('data: ', 1)[1]) for x in s.split('\n\n') if 'data: ' in x]
+types = [e['type'] for e in evs]
+assert 'response.custom_tool_call_input.delta' in types and 'response.custom_tool_call_input.done' in types
+out_items = evs[-1]['response']['output']
+assert out_items[-1]['type'] == 'custom_tool_call' and out_items[-1]['input'] == 'ab-12' and \
+    out_items[-1]['call_id'].startswith('call_') and 'arguments' not in out_items[-1], out_items
+fake['calls'] = []
+assert rpost(top_logprobs=2, include=['message.output_text.logprobs']).status_code == 200 and seen[-1]['logprobs'] == 2
+# RespOut: logprobs ride on the deltas and the part; an empty delta with held-back entries joins the open message
+o = server.RespOut()
+e1 = o.delta('content', 'a', [{'token': 'a'}]) + o.delta('content', '', [{'token': 'b'}]) + o.delta('content', '', [])
+assert [e['logprobs'] for e in e1 if e['type'] == 'response.output_text.delta'] == [[{'token': 'a'}], [{'token': 'b'}]]
+o.close()
+assert o.items[0]['content'][0]['logprobs'] == [{'token': 'a'}, {'token': 'b'}]
+assert server.RespOut().delta('content', '', [{'token': 'x'}]) == []  # (nothing open: no empty message item)
+# content parts the model can't take: 400 (images in system/developer messages, files, audio), not dropped
+for role, part in (('system', {'type': 'image_url', 'image_url': IMG}), ('developer', {'type': 'image_url', 'image_url': IMG}),
+                   ('user', {'type': 'file', 'file': {}}), ('user', {'type': 'input_audio'}), ('tool', {'type': 'file'})):
+    try:
+        chat.render(tok, [{'role': role, 'content': [part]}], image_tokens=lambda p: 1)
+        raise AssertionError((role, part))
+    except ValueError:
+        pass
+
+# 9. truncation 'auto' and /v1/responses/input_tokens (Engine.count on the tokenizer-only stub: text prompts)
+server.eng.count, server.eng.max_ctx = E.count, 400
+long_turn = 'lorem ipsum dolor ' * 20  # ~60 tokens
+hist = [{'type': 'message', 'role': 'user' if i % 2 == 0 else 'assistant', 'content': f'{i} {long_turn}'} for i in range(9)]
+body = dict(instructions='sys', max_output_tokens=100, input=hist)
+n_full = c.post('/v1/responses/input_tokens', json=body).json()
+assert n_full['object'] == 'response.input_tokens' and n_full['input_tokens'] > 300, n_full
+assert n_full['input_tokens'] == len(chat.render(tok, server.resp_to_chat(body)['messages'], None, 0.9))
+cb = server.resp_to_chat(dict(body, truncation='auto'))
+kept = server.fit(cb)
+assert kept[0] == {'role': 'system', 'content': 'sys'} and kept[-1]['content'].startswith('8 ')
+msgs = cb['messages']
+drop = len(msgs) - len(kept)  # (one message per turn here)
+assert drop >= 1 and kept == [msgs[0]] + msgs[1 + drop:]
+assert server.prompt_len(cb, kept) + 100 <= 400 < server.prompt_len(cb, [msgs[0]] + msgs[drop:]) + 100  # fewest dropped
+n_tr = c.post('/v1/responses/input_tokens', json=dict(body, truncation='auto')).json()['input_tokens']
+assert n_tr == server.prompt_len(cb, kept) < n_full['input_tokens']
+r = rpost(**dict(body, truncation='auto'))
+assert r.status_code == 200 and r.json()['truncation'] == 'auto'
+short = dict(input='hi', max_output_tokens=10)
+assert server.fit(server.resp_to_chat(dict(short, truncation='auto'))) == [{'role': 'user', 'content': 'hi'}]
+print('8 custom tools (regex enforced, lark described, chat + Responses items/events), allowed_tools, logprobs, '
+      'unsupported parts 400; 9 truncation auto (fewest oldest turns), input_tokens')
+
+# 10a. streamed tool calls (chat.Parser): a call written as rendered streams its args; the deltas add up to arguments
+import random  # noqa: E402
+
+rng = random.Random(1)
+ARGS = [{'city': 'Zürich', 'n': [1, 2, {'x': '}}'}]}, {'s': 'quote " brace } back \\ nl \n emoji 🚀'}, {}, {'a': '}'}]
+for args in ARGS:
+    body_ = chat.call_body('get_time', args)
+    for cut in (None, -3):  # (-3: cut short before END, e.g. max_tokens: the call keeps what was streamed)
+        toks = enc(body_)[:cut]
+        p, ds = chat.Parser(tok), []
+        for t in [chat.MODEL] + enc('get_time') + [chat.INVOKE_JSON] + toks + [chat.END]:
+            ds += p.feed(t)
+        kinds = [d[0] for d in ds]
+        if cut and kinds == ['content']:  # (cut inside the '{"name":..,"args":' prefix: nothing streamed, raw text)
+            assert not p.tool_calls and args == {}
+            continue
+        assert kinds[0] == 'call_start' and kinds[-1] == 'call_end' and set(kinds) <= {'call_start', 'call_args', 'call_end'}
+        streamed = ''.join(d[1] for d in ds if d[0] == 'call_args')
+        assert streamed == p.tool_calls[0]['arguments'] == ds[-1][1]['arguments'], (args, cut, ds)
+        if cut is None:
+            assert json.loads(streamed) == args
+assert [d[0] for d in ds[:2]] == ['call_start', 'call_args']  # (args go out before END)
+# CustomInput: any split of the args text decodes piece by piece to the exact input
+for inp in ('plain', 'a\nb "q" \\ é 🚀   tab\t', '', '\\u12'):
+    a = json.dumps({'input': inp}, ensure_ascii=rng.random() < 0.5, separators=(',', ':'))
+    for _ in range(30):
+        cuts = sorted(rng.sample(range(1, len(a)), min(len(a) - 1, rng.randint(0, 6))))
+        ci = server.CustomInput()
+        got = ''.join(ci.feed(a[i:j]) for i, j in zip([0] + cuts, cuts + [len(a)]))
+        assert got == inp and ci.finish(inp) == '', (inp, cuts, got)  # (all of it streamed, nothing left for the end)
+ci = server.CustomInput()
+assert ci.feed('{"other":1}') == '' and ci.finish('x') == 'x'  # not {"input":...}: all at the end
+# chat stream: tool_calls chunks open with id/type/name, then argument pieces; custom: decoded input pieces
+fake['stream'] = True
+for tools_, call, field in (([FN], {'name': 'get_time', 'arguments': '{"tz":"ET"}'}, 'function'),
+                            ([CT], {'name': 'patch', 'arguments': '{"input":"ab-12"}'}, 'custom')):
+    fake['calls'] = [call]
+    s = post(tools=tools_, stream=True).text
+    dels = [json.loads(x[6:])['choices'][0]['delta'] for x in s.split('\n\n') if x.startswith('data: {')]
+    tcs = [d['tool_calls'][0] for d in dels if 'tool_calls' in d]
+    assert tcs[0]['id'].startswith('call_') and tcs[0]['type'] == field and tcs[0][field]['name'] == call['name']
+    assert all(t['index'] == 0 and 'id' not in t for t in tcs[1:]) and len(tcs) >= 3
+    key = 'arguments' if field == 'function' else 'input'
+    assert ''.join(t[field][key] for t in tcs) == (call['arguments'] if field == 'function' else 'ab-12'), tcs
+# Responses stream: streamed function / custom call items
+for tools_, call, kind, field, want in (
+        ([{'type': 'function', 'name': 'get_time'}], {'name': 'get_time', 'arguments': '{"tz":"ET"}'}, 'function_call',
+         'arguments', '{"tz":"ET"}'), ([rt], {'name': 'patch', 'arguments': '{"input":"ab-12"}'}, 'custom_tool_call', 'input', 'ab-12')):
+    fake['calls'] = [call]
+    evs = [json.loads(x.split('data: ', 1)[1]) for x in rpost(stream=True, tools=tools_).text.split('\n\n') if 'data: ' in x]
+    dl = [e['delta'] for e in evs if e['type'] == f'response.{kind}_{field}.delta']
+    assert len(dl) >= (2 if field == 'arguments' else 1) and ''.join(dl) == want, (kind, dl)  # (custom: 'ab-12' is in one piece)
+    assert [e for e in evs if e['type'] == f'response.{kind}_{field}.done'][0][field] == want
+    assert evs[-1]['response']['output'][-1][field] == want and evs[-1]['response']['output'][-1]['status'] == 'completed'
+fake['stream'], fake['calls'] = False, []
+
+# 10b. chat: refusal / system_fingerprint / service_tier; legacy functions / function_call
+r = post().json()
+assert r['system_fingerprint'].startswith('fp_') and r['service_tier'] == 'default' and r['choices'][0]['message']['refusal'] is None
+assert post(service_tier='flex').json()['service_tier'] == 'flex'
+assert all('system_fingerprint' in json.loads(x[6:]) for x in post(stream=True).text.split('\n\n') if x.startswith('data: {'))
+FNS = [{'name': 'get_time', 'description': 'd', 'parameters': {'type': 'object'}}]
+fake['calls'] = [{'name': 'get_time', 'arguments': '{"tz":"ET"}'}]
+r = post(functions=FNS, function_call={'name': 'get_time'}).json()['choices'][0]
+assert r['message']['function_call'] == fake['calls'][0] and 'tool_calls' not in r['message'] and \
+    r['finish_reason'] == 'function_call', r
+assert seen[-1]['tools'] == [{'type': 'function', 'function': FNS[0]}] and seen[-1]['one_call'] and \
+    isinstance(seen[-1]['tool_force'], grammar.Tools) and not seen[-1]['tool_force'].lazy
+fake['stream'] = True
+s = post(functions=FNS, stream=True).text
+fcs = [d['function_call'] for d in (json.loads(x[6:])['choices'][0]['delta'] for x in s.split('\n\n')
+                                   if x.startswith('data: {')) if 'function_call' in d]
+assert fcs[0]['name'] == 'get_time' and ''.join(f['arguments'] for f in fcs) == '{"tz":"ET"}', fcs
+assert '"finish_reason": "function_call"' in s
+fake['stream'], fake['calls'] = False, []
+lb, legacy = server.legacy_functions(dict(functions=FNS, messages=[
+    {'role': 'user', 'content': 'time?'}, {'role': 'assistant', 'content': None, 'function_call': {'name': 'get_time', 'arguments': '{}'}},
+    {'role': 'function', 'name': 'get_time', 'content': '9am'}]))
+assert legacy and lb['messages'][1]['tool_calls'] == [{'id': 'fn1', 'type': 'function', 'function': {'name': 'get_time', 'arguments': '{}'}}]
+assert lb['messages'][2] == {'role': 'tool', 'tool_call_id': 'fn1', 'name': 'get_time', 'content': '9am'} and 'functions' not in lb
+assert server.legacy_functions(dict(messages=[{'role': 'user', 'content': 'x'}]))[1] is False
+assert post(functions=FNS, tools=TOOLS).status_code == 400
+
+# 10c. prediction: parsed to ids; as copy drafts from Lookup(pre=) the output is unchanged and drafts get accepted
+assert post(prediction={'type': 'content', 'content': 'hello world'}).status_code == 200 and seen[-1]['prediction'] == enc('hello world')
+assert post(prediction={'type': 'content', 'content': [{'type': 'text', 'text': 'a'}]}).status_code == 200 and seen[-1]['prediction'] == enc('a')
+assert post(prediction={'type': 'x'}).status_code == 400
+assert 'accepted_prediction_tokens' in post(prediction={'type': 'content', 'content': 'x'}).json()['usage']['completion_tokens_details']
+lk = Lookup([1, 2, 3], pre=[7, 8, 9, 10])
+assert len(lk) == 3 and lk.ids == [1, 2, 3]
+lk.extend([7, 8])
+assert lk.draft(5) == [9, 10] and lk.from_pred  # (copies out of the prediction, never past its end)
+assert Lookup([5, 6, 5], pre=[1]).draft(3) == [6, 5] and True
+spec_runner._Spec_sync = spec_runner.Spec._sync
+lk2 = Lookup([1, 2], pre=[9, 9])
+spec_runner.Spec._sync(lk2, 5, 4, lambda: [1, 2, 3, 3, 3, 4])  # out of step: rebuilt from hist, the prediction kept
+assert lk2.ids == [1, 2, 3, 3, 3, 4] and lk2.a[:2].tolist() == [9, 9] and len(lk2) == 6
+W = [int(x) for x in torch.randint(1000, 5000, (50,), generator=torch.Generator().manual_seed(3))]
+PR = enc('Rewrite the following, keeping it the same.')
+
+
+def seq_logits(h):  # greedy target: writes W after the prompt, then EOS
+    lg = noise(len(h), 1.0)
+    i = len(h) - len(PR)
+    lg[W[i] if 0 <= i < len(W) else chat.EOS] += 12
+    return lg
+
+
+def run_pred(pred, on=True):
+    global cyc_logits
+    old, cyc_logits = cyc_logits, seq_logits  # (FakeBD and _take read the module's cyc_logits)
+    try:
+        E.bd = FakeBD(PR)
+        r_, _ = mkreq(E, PR, max_tokens=80, prefill_text=True, temperature=0, prediction=pred)
+        if on:
+            r_.sp = spec_runner.Spec(None, E.bd, None, lookup=Lookup(r_.prompt, pre=r_.pred), temperature=0,
+                                     stop=(chat.EOS,), kmax=7, pstats=r_.stats)
+            r_.sp.attach(0, len(PR))
+        r_.slot, r_.pos = 0, len(PR)
+        E._take([r_], cyc_logits(PR)[None])
+        while not r_.done:
+            E.decode_step([r_])
+        return r_
+    finally:
+        cyc_logits = old
+
+
+plain = run_pred(None, on=False)
+good, junk = run_pred(W[:20] + [7, 7] + W[22:]), run_pred([11, 12, 13] * 10)
+assert good.out == plain.out == junk.out and plain.out[:50] == W, (plain.out, good.out)
+assert good.stats['accepted_prediction_tokens'] >= 40 and good.stats['rejected_prediction_tokens'] >= 1, good.stats
+assert not junk.stats.get('accepted_prediction_tokens'), junk.stats
+assert good.sp.stats['rounds'] < len(good.out) / 3, good.sp.stats  # (several tokens per step where it matched)
+
+# 10d. /v1/models/{id}; /v1/completions (raw prompt, echo, best_of, n, token prompts, stream, 400s)
+assert c.get(f'/v1/models/{server.SERVED}').json()['id'] == server.SERVED and c.get('/v1/models/nope').status_code == 404
+cpost = lambda **kw: c.post('/v1/completions', json=dict(model='m', **kw))
+r = cpost(prompt='Once upon').json()
+assert r['object'] == 'text_completion' and r['choices'][0]['text'] == 'ok0 ok1 ' and r['choices'][0]['finish_reason'] == 'stop'
+assert seen[-1]['prefill_text'] and seen[-1]['tools'] is None and seen[-1]['max_tokens'] == 16  # (endpoint default)
+assert r['usage'] == {'prompt_tokens': 1, 'completion_tokens': 2, 'total_tokens': 3}
+r = cpost(prompt=['a', [1, 2, 3]], n=2, best_of=3, echo=True, max_tokens=5).json()
+assert [ch['index'] for ch in r['choices']] == [0, 1, 2, 3] and r['choices'][0]['text'] == 'aok0 ok1 '
+assert r['choices'][2]['text'].startswith(tok.decode([1, 2, 3])) and r['usage']['completion_tokens'] == 12  # 2 x 3 billed
+assert seen[-1]['logprobs'] == 0 and seen[-1]['max_tokens'] == 5  # (best_of ranks by logprobs)
+s = cpost(prompt='a', echo=True, stream=True, stream_options={'include_usage': True}).text
+ch = [json.loads(x[6:]) for x in s.split('\n\n') if x.startswith('data: {')]
+assert ch[0]['choices'][0]['text'] == 'a' and ''.join(x['choices'][0]['text'] for x in ch if x['choices']) == 'aok0 ok1 '
+assert ch[-1]['usage']['completion_tokens'] == 2 and s.endswith('data: [DONE]\n\n')
+assert server.compl_logprobs([{'token': 'ab', 'logprob': -0.5, 'top_logprobs': [{'token': 'ab', 'logprob': -0.5}]},
+                              {'token': 'c', 'logprob': -1.0, 'top_logprobs': []}], 3) == {
+    'tokens': ['ab', 'c'], 'token_logprobs': [-0.5, -1.0], 'top_logprobs': [{'ab': -0.5}, {}], 'text_offset': [3, 5]}
+for bad in (dict(prompt='a', suffix='z'), dict(prompt='a', n=3, best_of=2), dict(prompt='a', best_of=2, stream=True),
+            dict(prompt='a', echo=True, logprobs=1), dict(prompt=[]), dict(prompt=[999999999]), dict(prompt=[chat.IMG_TOK]),
+            dict(prompt='a', logprobs=21), dict(prompt=['a'] * 17), dict(prompt='')):
+    assert cpost(**bad).status_code == 400, bad
+rr = Engine.request(E, None, prompt_ids=[5, 6, 7], max_tokens=4, prefill_text=True) if hasattr(E, 'pool') else None
+assert rr is None or (rr.ids == [5, 6, 7] and rr.parser.kind == 'content')  # (raw prompt: no [MODEL, TEXT] appended)
+print('10 streamed tool calls (parser, custom input decoding, chat + Responses), fingerprint/tier/refusal, legacy '
+      'functions, prediction (copy drafts, output unchanged), models/{id}, /v1/completions')
 print('ALL OK')

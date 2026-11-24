@@ -24,16 +24,21 @@ class Lookup:
     plus filters on the candidates (~0.05-0.3 ms at 200k), and while the text keeps copying (the new ids equal the
     followers of the last match) the match just moves along without a search. The suffix never matches itself."""
 
-    def __init__(self, ids=(), n=32):
-        self.n, self.a, self.L, self.last = n, np.zeros(max(1024, 2 * len(ids)), np.int32), 0, None
+    def __init__(self, ids=(), n=32, pre=()):
+        """pre: extra ids searched before the sequence but not part of it (a predicted output, OpenAI `prediction`):
+        a match inside pre copies from pre (span stops at its end); len() and ids are the sequence's alone."""
+        self.n, self.a, self.L, self.last = n, np.zeros(max(1024, 2 * (len(ids) + len(pre))), np.int32), 0, None
+        self.base, self.from_pred = 0, False  # from_pred: the last span came out of pre
+        self.extend(pre)
+        self.base = self.L
         self.extend(ids)
 
     def __len__(self):
-        return self.L
+        return self.L - self.base
 
     @property
     def ids(self):
-        return self.a[:self.L].tolist()
+        return self.a[self.base:self.L].tolist()
 
     def extend(self, ids):
         ids = np.asarray(ids, dtype=np.int32).reshape(-1)
@@ -64,7 +69,8 @@ class Lookup:
             dl = self.L - L0
             if dl == 0:
                 return j, n
-            if j is not None and j + dl < self.L and np.array_equal(self.a[j:j + dl], self.a[L0:self.L]):
+            if j is not None and j + dl < (self.base if j < self.base else self.L) and \
+                    np.array_equal(self.a[j:j + dl], self.a[L0:self.L]):
                 self.last = (self.L, j + dl, min(n + dl, self.n))
                 return self.last[1:]
         j, n = self.find(self.a[max(0, self.L - self.n):self.L])
@@ -77,8 +83,9 @@ class Lookup:
         return self.find(t[-self.n:])
 
     def span(self, j, k, stop=()):
-        """Up to k ids from j (never past the end); ends with the first stop id."""
-        d = self.a[j:min(j + k, self.L)].tolist()
+        """Up to k ids from j (never past the end, nor out of pre); ends with the first stop id."""
+        self.from_pred = j < self.base
+        d = self.a[j:min(j + k, self.base if self.from_pred else self.L)].tolist()
         for i, t in enumerate(d):
             if t in stop:
                 return d[:i + 1]

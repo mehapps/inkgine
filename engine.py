@@ -153,7 +153,9 @@ class Request:
     def __init__(self, eng, ids, pre, keep=False, max_tokens=0, temperature=1.0, top_p=1.0, top_k=0, seed=None,
                  prefill_text=False, response_format=None, stop=None, stats=None, emit=None, prio=0, cancel=None,
                  spec=None, logprobs=None, presence_penalty=0.0, frequency_penalty=0.0, repetition_penalty=1.0,
-                 logit_bias=None, min_p=0.0, min_tokens=0, stop_ids=None, tool_force=None, one_call=False):
+                 logit_bias=None, min_p=0.0, min_tokens=0, stop_ids=None, tool_force=None, one_call=False,
+                 prediction=None):
+        self.pred = list(prediction or ())          # predicted output ids: a source of copy drafts (speculation only)
         self.prompt = self.ids = ids                # ids: tokens to prefill (a parked decode: prompt + fed tokens)
         self.pre, self.keep, self.need = pre, keep, len(ids) + max_tokens   # need: positions reserved
         self.max_tokens, self.temperature, self.top_p, self.top_k = max_tokens, temperature, top_p, top_k
@@ -184,6 +186,7 @@ class Request:
         self.ban = [chat.EOS] + [chat.END] * prefill_text + sorted(self.stop_ids)  # held off until min_tokens
         self.proc = bool(self.pen or self.bias is not None or min_tokens)  # logit processors (_process)
         self.out = []                               # sampled ids; while decoding the last one is pending (not fed)
+        self.n_reason = 0                           # of those, tokens inside a thinking block (its body + closing END)
         self.err = None                             # an error that failed this request alone in a decode step
         self.spec, self.sp = spec, None             # spec: False = no speculative decoding; sp: its Spec while running
         self.seq = self.f = self.slot = self.img = None
@@ -264,6 +267,25 @@ class Engine:
             return rows * cols
         ids = chat.render(self.tok, messages, tools, effort, count)
         return ids, pre
+
+    def count(self, messages, tools=None, effort=0.9, memo=None):
+        """Prompt length in tokens, images sized from their headers only (no decode): /v1/responses/input_tokens and
+        truncation. memo: {id(part): tiles} across calls on the same messages (an http image is fetched once)."""
+        memo = {} if memo is None else memo
+
+        def tiles(part):
+            if self.vision is None:
+                raise BadRequest('images disabled')
+            if id(part) not in memo:
+                try:
+                    r, c = image_grid(load_image(image_bytes(part)))
+                except BadRequest:
+                    raise
+                except Exception as e:
+                    raise BadRequest(f'bad image: {e}')
+                memo[id(part)] = r * c
+            return memo[id(part)]
+        return len(chat.render(self.tok, messages, tools, effort, tiles))
 
     @staticmethod
     def _pixels(req):
@@ -413,8 +435,8 @@ class Engine:
             return None
         stop = (chat.EOS, chat.END) if req.prefill_text else (chat.EOS,)
         kw = dict(temperature=req.temperature, top_p=req.top_p, top_k=req.top_k, gen=req.gen, cons=req.cons, stop=stop,
-                  min_p=req.min_p, seed=req.seed)
-        lookup = lambda: Spec(None, self.bd, None, lookup=Lookup(req.prompt), dev=self.model.dev, **kw)
+                  min_p=req.min_p, seed=req.seed, pred=req.pred, pstats=req.stats)
+        lookup = lambda: Spec(None, self.bd, None, lookup=Lookup(req.prompt, pre=req.pred), dev=self.model.dev, **kw)
         if mode == 'lookup':
             return lookup()
         try:
@@ -476,16 +498,20 @@ class Engine:
                 raise NoRoom(f'{n} tokens')
             self.unpark(self.parked.pop(0))
 
-    def request(self, messages, max_tokens=512, effort=0.9, tools=None, prefill_text=False, **kw):
+    def request(self, messages, max_tokens=512, effort=0.9, tools=None, prefill_text=False, prompt_ids=None, **kw):
         """-> Request (tokenized, images preprocessed; BadRequest if it can't fit). kw: Request's sampling, seed,
-        response_format (grammar.compile_format), stop, stats, emit, prio, cancel."""
-        ids, pre = self.prepare(messages, tools, effort)
-        if prefill_text:  # thinking off: the model's turn starts as a text message
+        response_format (grammar.compile_format), stop, stats, emit, prio, cancel. prompt_ids: a raw prompt instead of
+        rendered messages (/v1/completions): no chat template; with prefill_text the reply is plain text to END/EOS."""
+        if prompt_ids is not None:
+            ids, pre = list(prompt_ids), []
+        else:
+            ids, pre = self.prepare(messages, tools, effort)
+        if prefill_text and prompt_ids is None:  # thinking off: the model's turn starts as a text message
             ids += [chat.MODEL, chat.TEXT]
         if len(ids) + max_tokens > self.max_ctx:
             raise BadRequest(f'prompt {len(ids)} + max_tokens {max_tokens} > context {self.max_ctx}')
         # SSD wear: only chats likely to continue (earlier assistant/tool turns, or tools) are worth a disk copy
-        keep = len(ids) >= DISK_MIN and bool(tools or any(x.get('role') in ('assistant', 'tool') for x in messages))
+        keep = len(ids) >= DISK_MIN and bool(tools or any(x.get('role') in ('assistant', 'tool') for x in messages or ()))
         req = Request(self, ids, pre, keep, max_tokens, prefill_text=prefill_text, **kw)
         req.keys = self.keys(ids, pre)  # (here, on the executor thread, not in the scheduler's _start)
         return req
@@ -832,6 +858,7 @@ class Engine:
         accepted all of them, so its done flag holds only for the last one)."""
         r.out.append(t)
         n, st = len(r.out), r.stopper
+        r.n_reason += r.parser.kind == 'reasoning'
         if li is not None and r.parser.kind == 'content' and t < chat.USER:  # a content token: its logprob entry
             r.lp_pend.append(dict(self.tok_entry(t, li[0]), top_logprobs=[self.tok_entry(i, v) for i, v in li[1]]))
 
@@ -865,7 +892,7 @@ class Engine:
             if r.lp_pend:  # entries of tokens whose text was held back or cut (stop string)
                 emit('content', '')
             natural = r.hit or t in (chat.EOS, chat.END) or t in r.stop_ids or cdone or one
-            r.stats.update(completion_tokens=n, decode_s=time.time() - r.t1, tool_calls=r.parser.tool_calls,
+            r.stats.update(completion_tokens=n, reasoning_tokens=r.n_reason, decode_s=time.time() - r.t1, tool_calls=r.parser.tool_calls,
                            finish_reason='length' if n >= r.max_tokens and not natural else 'stop')
 
     def drop_parked(self, req):
@@ -1061,7 +1088,7 @@ class Engine:
             self._prefill_all(req, preempt)
             self.to_decode(req, 0)
             while True:
-                yield from out
+                yield from (v for v in out if v[0] in ('reasoning', 'content'))  # (not the call_* deltas)
                 out.clear()
                 if getattr(req, 'err', None) is not None:
                     raise req.err

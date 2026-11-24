@@ -40,7 +40,11 @@ for t in out:
 reasoning = ''.join(d[1] for d in deltas if d[0] == 'reasoning')
 content = ''.join(d[1] for d in deltas if d[0] == 'content')
 assert reasoning == 'Need Paris too.' and content == 'Checking Paris.', deltas
-assert p.tool_calls == [{'name': 'get_weather', 'arguments': json.dumps({'city': 'Paris'})}], p.tool_calls
+# the call is written as rendered: its args stream (call_start, call_args...) and its arguments are exactly that text
+assert p.tool_calls == [{'name': 'get_weather', 'arguments': '{"city":"Paris"}'}], p.tool_calls
+calls = [d for d in deltas if d[0].startswith('call_')]
+assert calls[0] == ('call_start', 'get_weather') and calls[-1] == ('call_end', p.tool_calls[0])
+assert ''.join(d[1] for d in calls if d[0] == 'call_args') == '{"city":"Paris"}', calls
 print('parse ok:', p.tool_calls)
 
 # server: thinking off + tools -> no MODEL TEXT prefill (the model may answer with a tool call)

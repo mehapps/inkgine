@@ -3,6 +3,7 @@ INK_MAX_BATCH requests decode together, one prefill chunk at a time interleaved 
 Run: cd engine && PATH=$PWD/.venv/bin:$PATH .venv/bin/python server.py   (env: INK_HOST, INK_PORT, INK_MAX_CTX, INK_SERVED,
 INK_SPEC=dspark|lookup|off; body field `spec: false` turns speculative decoding off for one request)"""
 import asyncio
+import base64
 import heapq
 import itertools
 import json
@@ -33,6 +34,7 @@ import threading
 import time
 import uuid
 import weakref
+from types import SimpleNamespace
 
 import torch
 import uvicorn
@@ -484,10 +486,19 @@ def metrics():
     return PlainTextResponse('\n'.join(lines) + '\n')
 
 
+def model_card():
+    return {'id': SERVED, 'object': 'model', 'created': 0, 'owned_by': 'local', 'max_model_len': eng.max_ctx if eng else None}
+
+
 @app.get('/v1/models')
 def models():
-    return {'object': 'list', 'data': [{'id': SERVED, 'object': 'model', 'owned_by': 'local',
-                                         'max_model_len': eng.max_ctx if eng else None}]}
+    return {'object': 'list', 'data': [model_card()]}
+
+
+@app.get('/v1/models/{model_id:path}')
+def model(model_id: str):
+    return model_card() if model_id == SERVED else JSONResponse(
+        {'error': {'message': f'model {model_id!r} not found', 'type': 'invalid_request_error', 'code': 'model_not_found'}}, 404)
 
 
 def err(code, msg):
@@ -496,14 +507,159 @@ def err(code, msg):
 
 # Known OpenAI / SGLang parameters we don't implement: 400 instead of silently ignoring them. Unknown fields and
 # metadata-only ones (user, store, metadata, LiteLLM's own) are ignored, as SGLang does.
-UNSUPPORTED = ('ignore_eos', 'regex', 'ebnf', 'prediction', 'audio', 'web_search_options', 'logit_processor',
-               'functions', 'function_call', 'echo', 'best_of', 'suffix')
+UNSUPPORTED = ('ignore_eos', 'regex', 'ebnf', 'audio', 'web_search_options', 'logit_processor', 'echo', 'best_of',
+               'suffix')  # (echo / best_of: /v1/completions; suffix: insertion, which the model wasn't trained for)
 MAX_N = 8
+DEFAULT_MAX_TOKENS = 4096
+tool_name = lambda t: (t.get('function') or t.get('custom') or t).get('name') if isinstance(t, dict) else None
+
+
+def chat_tools(body):
+    """tools + tool_choice -> (tools as rendered, tool_choice for grammar.compile_tools, custom tool names).
+    Custom (free-form text) tools become functions taking one string `input`, the call format the model knows: a regex
+    format is enforced through the string's pattern, a Lark grammar only goes into the description (shortcut: Lark is
+    not compiled to a constraint; compile it if a client depends on it). allowed_tools renders only the allowed tools."""
+    choice = 'auto' if body.get('tool_choice') is None else body['tool_choice']
+    tools = body.get('tools') or []
+    if choice == 'none':  # no tools rendered
+        return None, 'none', set()
+    if not isinstance(tools, list):
+        raise BadRequest('tools must be a list')
+    if isinstance(choice, dict) and choice.get('type') == 'allowed_tools':
+        a = choice.get('allowed_tools') or {}
+        allow = {tool_name(t) for t in a.get('tools') or []}
+        tools, choice = [t for t in tools if tool_name(t) in allow], a.get('mode', 'auto')
+        if choice not in ('auto', 'required'):
+            raise BadRequest("allowed_tools mode must be 'auto' or 'required'")
+    if isinstance(choice, dict) and choice.get('type') == 'custom':
+        choice = {'type': 'function', 'function': {'name': (choice.get('custom') or {}).get('name')}}
+    out, custom = [], set()
+    for t in tools:
+        if not isinstance(t, dict) or t.get('type', 'function') not in ('function', 'custom'):
+            raise BadRequest(f'unsupported tool type {t.get("type") if isinstance(t, dict) else t!r}')
+        if t.get('type') != 'custom':
+            out.append(t)
+            continue
+        c = t.get('custom') or {}
+        if not isinstance(c.get('name'), str) or not c['name']:
+            raise BadRequest('custom tool needs a name')
+        fmt, desc = c.get('format') or {'type': 'text'}, c.get('description') or ''
+        s = {'type': 'string'}
+        if fmt.get('type') == 'grammar' and fmt.get('syntax') == 'regex' and isinstance(fmt.get('definition'), str):
+            s['pattern'] = fmt['definition']
+        elif fmt.get('type') == 'grammar' and fmt.get('syntax') == 'lark' and isinstance(fmt.get('definition'), str):
+            desc += f'\n\nThe input must match this Lark grammar:\n{fmt["definition"]}'
+        elif fmt.get('type') != 'text':
+            raise BadRequest("custom tool format must be text or a grammar with syntax 'regex' or 'lark'")
+        custom.add(c['name'])
+        out.append({'type': 'function', 'function': {'name': c['name'], 'description': desc, 'parameters': {
+            'type': 'object', 'properties': {'input': s}, 'required': ['input']}}})
+    return out or None, choice, custom
+
+
+def custom_input(tc):
+    """A parsed call of a custom tool -> its raw input (the `input` string chat_tools declared)."""
+    try:
+        v = json.loads(tc['arguments']).get('input', '')
+    except (ValueError, AttributeError):  # (a call cut short by max_tokens)
+        return ''
+    return v if isinstance(v, str) else json.dumps(v)
+
+
+class CustomInput:
+    """A custom tool's raw input, streamed out of its args text {"input":"..."} as that arrives: the JSON string is
+    unescaped piece by piece, cut only at safe points (never inside an escape or a surrogate pair), so the pieces add up
+    to the decoded string. Args written another way stream nothing (finish() gives it all)."""
+    PRE = '{"input":"'
+
+    def __init__(self):
+        self.raw, self.pos, self.out, self.closed = '', len(self.PRE), 0, False  # pos: raw index decoded up to
+
+    def feed(self, d):
+        self.raw += d
+        r, i = self.raw, self.pos
+        if self.closed or not r.startswith(self.PRE):
+            return ''
+        while i < len(r):
+            c = r[i]
+            if c == '"':
+                self.closed = True
+                break
+            if c != '\\':
+                i += 1
+            elif i + 1 >= len(r):
+                break
+            elif r[i + 1] != 'u':
+                i += 2
+            elif i + 6 > len(r) or (r[i + 2] in 'dD' and r[i + 3] in '89abAB' and i + 12 > len(r)):
+                break  # \uXXXX not complete yet, or a high surrogate waiting for its pair
+            else:
+                i += 6
+        try:
+            s = json.loads('"' + r[self.pos:i] + '"')
+        except ValueError:
+            self.closed = True  # (not a JSON string after all: the rest comes with finish)
+            return ''
+        self.pos, self.out = i, self.out + len(s)
+        return s
+
+    def finish(self, final):
+        """The rest of the final input after what feed emitted."""
+        return final[self.out:]
+
+
+SYSTEM_FP = None
+
+
+def system_fingerprint():
+    """fp_ + the weights id (changes when the weights do), as OpenAI's per-backend-config fingerprint."""
+    global SYSTEM_FP
+    if SYSTEM_FP is None:
+        wid = getattr(getattr(eng, 'pool', None), 'wid', None)
+        SYSTEM_FP = 'fp_' + (wid[:12] if isinstance(wid, str) else 'inkgine')
+    return SYSTEM_FP
+
+
+def legacy_functions(body):
+    """The deprecated functions / function_call -> tools / tool_choice (one call per reply, as that API had); role
+    'function' messages -> tool messages and assistant function_call -> a tool call (ids f'fn{n}' link them).
+    -> (body, legacy?)."""
+    fns, fc = body.get('functions'), body.get('function_call')
+    msgs = body.get('messages') or []
+    if not fns and fc is None and not any(isinstance(m, dict) and (m.get('role') == 'function' or m.get('function_call'))
+                                         for m in msgs):
+        return body, False
+    if body.get('tools') and fns:
+        raise BadRequest('use tools or functions, not both')
+    out, n = [], 0
+    for m in msgs:
+        if isinstance(m, dict) and m.get('function_call'):
+            n += 1
+            m = dict({k: v for k, v in m.items() if k != 'function_call'}, tool_calls=[
+                {'id': f'fn{n}', 'type': 'function', 'function': m['function_call']}])
+        elif isinstance(m, dict) and m.get('role') == 'function':
+            m = {'role': 'tool', 'tool_call_id': f'fn{n}', 'name': m.get('name'), 'content': m.get('content') or ''}
+        out.append(m)
+    body = {k: v for k, v in body.items() if k not in ('functions', 'function_call')}
+    body['messages'] = out
+    if fns:
+        body.update(tools=[{'type': 'function', 'function': f} for f in fns], parallel_tool_calls=False)
+        if fc is not None:
+            body['tool_choice'] = fc if isinstance(fc, str) else {'type': 'function', 'function': {'name': fc.get('name')}}
+    return body, bool(fns)
+
+
+def chat_messages(msgs):
+    """Assistant custom tool calls -> function calls with arguments {"input": ...} (as chat_tools declares them)."""
+    fix = lambda c: {'id': c.get('id'), 'type': 'function', 'function': {
+        'name': (c.get('custom') or {}).get('name'), 'arguments': json.dumps({'input': (c.get('custom') or {}).get('input', '')})}}
+    return [dict(m, tool_calls=[fix(c) if isinstance(c, dict) and c.get('type') == 'custom' else c for c in m['tool_calls']])
+            if isinstance(m, dict) and isinstance(m.get('tool_calls'), list) else m for m in msgs]
 
 
 def parse(body):
-    """Request body -> (n, engine kwargs per request without stats/emit/cancel, logprobs on). BadRequest / ValueError /
-    TypeError on a bad request. Compiles grammars, so it runs off the event loop."""
+    """Request body -> (n, engine kwargs per request without stats/emit/cancel, logprobs on, custom tool names).
+    BadRequest / ValueError / TypeError on a bad request. Compiles grammars, so it runs off the event loop."""
     g = lambda k, d=None: d if body.get(k) is None else body[k]  # null == absent (clients send nulls)
     bad = [k for k in UNSUPPORTED if body.get(k) not in (None, False, [], {})]
     if bad or (body.get('modalities') or ['text']) != ['text']:
@@ -525,8 +681,7 @@ def parse(body):
     sids = g('stop_token_ids', [])
     if not isinstance(sids, list) or not all(isinstance(x, int) and 0 <= x < grammar.VOCAB for x in sids):
         raise BadRequest('stop_token_ids must be a list of token ids')
-    choice, tools = g('tool_choice', 'auto'), g('tools')
-    tools = None if choice == 'none' else tools  # 'none': no tools rendered
+    tools, choice, custom = chat_tools(body)
     parallel = g('parallel_tool_calls', True)
     if not isinstance(parallel, bool):
         raise BadRequest('parallel_tool_calls must be true or false')
@@ -560,33 +715,36 @@ def parse(body):
     seed = g('seed')
     if seed is not None and not -2 ** 63 <= int(seed) < 2 ** 64:
         raise BadRequest('seed must be a 64-bit integer')
+    pred = g('prediction')  # predicted output: copy-draft source for speculation (same output, faster where it matches)
+    if pred is not None:
+        pc = pred.get('content') if isinstance(pred, dict) and pred.get('type') == 'content' else None
+        pc = pc if isinstance(pc, str) else ''.join(p.get('text', '') for p in pc if isinstance(p, dict)
+                                                    and p.get('type') == 'text') if isinstance(pc, list) else None
+        if pc is None:
+            raise BadRequest('prediction must be {"type": "content", "content": a string or text parts}')
+        pred = eng.tok.encode(pc, add_special_tokens=False).ids
     mt = g('max_completion_tokens') if g('max_completion_tokens') is not None else g('max_tokens')
     if mt is not None and int(mt) < 1:
         raise BadRequest('max_tokens must be >= 1')
-    kw = dict(max_tokens=int(mt or 4096), temperature=temperature,
+    kw = dict(max_tokens=int(mt or DEFAULT_MAX_TOKENS), temperature=temperature,
               top_p=top_p, top_k=max(int(g('top_k', 0)), 0), effort=effort, tools=tools,
               seed=None if seed is None else int(seed), prefill_text=no_think and not tools,  # tools may follow text
               response_format=rf, stop=[x for x in stop if x] or None, spec=spec, logprobs=top if lp else None,
               presence_penalty=pres, frequency_penalty=freq, repetition_penalty=rep, logit_bias=bias or None,
               min_p=min_p, min_tokens=min_tokens, stop_ids=sids or None, tool_force=force,
-              one_call=bool(tools) and not parallel)
-    return n, kw, lp
+              one_call=bool(tools) and not parallel, prediction=pred or None)
+    return n, kw, lp, custom
 
 
-@app.post('/v1/chat/completions')
-async def completions(request: Request):
-    t_arr = time.time()
-    try:
-        body = await request.json()
-    except ValueError:
-        return err(400, 'body is not JSON')
-    if not isinstance(body, dict) or not isinstance(body.get('messages'), list) or not body['messages']:
-        return err(400, 'messages must be a non-empty list')
+async def submit(body, t_arr, prompts=None):
+    """Chat-format body -> SimpleNamespace(reqs, stats, events, cancel, lp, custom) for the endpoints to format, or an
+    error response. events() submits the requests and yields (choice, kind, value); leaving it early cancels them.
+    prompts: raw prompts (lists of ids, /v1/completions) instead of body['messages']: n requests per prompt, plain text
+    replies, choice index = prompt * n + i."""
     try:
         prio = priority_of(body)
     except (TypeError, ValueError) as e:
         return err(400, f'bad parameter: {e}')
-    rid, created = 'chatcmpl-' + uuid.uuid4().hex[:24], int(time.time())
     q, cancel = asyncio.Queue(), threading.Event()  # one cancel for all n choices (the client is gone for all)
     loop = asyncio.get_running_loop()
     box = Outbox.of(loop)
@@ -595,15 +753,22 @@ async def completions(request: Request):
         """n requests sharing the prompt (the second and later restore the first's parked prompt state, so their
         prefill is ~free; prompts < INK_SNAP_MIN tokens aren't parked and are simply re-prefilled). Choice i's seed is
         seed + i, so seeded choices differ but are reproducible."""
-        n, kw, lp = parse(body)
+        n, kw, lp, custom = parse(body)
+        if prompts is None:
+            msgs, todo = chat_messages(body['messages']), [None]
+        else:
+            msgs, todo = None, prompts
+            kw.update(prefill_text=True, tools=None, tool_force=None, one_call=False)
         reqs = []
-        for i in range(n):
-            k = dict(kw, seed=None if kw['seed'] is None else kw['seed'] + i)
-            emit = lambda *m, i=i: box.put(q, (i,) + m)  # from the scheduler thread
-            reqs.append(eng.request(body['messages'], stats={}, emit=emit, prio=prio, cancel=cancel, **k))
-        return reqs, lp
+        for p in todo:
+            for _ in range(n):
+                i = len(reqs)
+                k = dict(kw, seed=None if kw['seed'] is None else kw['seed'] + i)
+                emit = lambda *m, i=i: box.put(q, (i,) + m)  # from the scheduler thread
+                reqs.append(eng.request(msgs, stats={}, emit=emit, prio=prio, cancel=cancel, prompt_ids=p, **k))
+        return reqs, lp, custom
     try:  # parsing, grammar compiles, tokenize + image preprocessing: off the event loop and the scheduler thread
-        reqs, want_lp = await loop.run_in_executor(None, build)
+        reqs, want_lp, custom = await loop.run_in_executor(None, build)
     except BadRequest as e:
         return err(400, str(e))
     except (TypeError, ValueError) as e:
@@ -613,7 +778,6 @@ async def completions(request: Request):
     M['tokenize_s'] += tok_s
     for s in stats:
         s.setdefault('tm', {}).update(arrive=t_arr, tokenize_s=tok_s)
-    want_tm = body.get('timings') is True  # non-standard: latency breakdown in the response (benchmarks)
 
     async def events():
         for r in reqs:
@@ -629,31 +793,65 @@ async def completions(request: Request):
                         break
         finally:
             cancel.set()  # queued: skipped; running: ends at the next step (slot + pages freed)
+    return SimpleNamespace(reqs=reqs, stats=stats, events=events, cancel=cancel, lp=want_lp, custom=custom)
+
+
+async def watch(request, cancel):
+    """Non-stream requests: a client that hangs up frees its slot (only streams get cancelled by Starlette)."""
+    while not cancel.is_set():
+        if await request.is_disconnected():
+            cancel.set()
+            return
+        await asyncio.sleep(1.0)
+
+
+@app.post('/v1/chat/completions')
+async def completions(request: Request):
+    t_arr = time.time()
+    try:
+        body = await request.json()
+    except ValueError:
+        return err(400, 'body is not JSON')
+    if not isinstance(body, dict) or not isinstance(body.get('messages'), list) or not body['messages']:
+        return err(400, 'messages must be a non-empty list')
+    rid, created = 'chatcmpl-' + uuid.uuid4().hex[:24], int(time.time())
+    try:
+        body, legacy = legacy_functions(body)  # (legacy: reply with message.function_call, the old API's shape)
+    except BadRequest as e:
+        return err(400, str(e))
+    run = await submit(body, t_arr)
+    if isinstance(run, JSONResponse):
+        return run
+    reqs, stats, events, cancel, want_lp = run.reqs, run.stats, run.events, run.cancel, run.lp
+    want_tm = body.get('timings') is True  # non-standard: latency breakdown in the response (benchmarks)
+    head = {'id': rid, 'created': created, 'model': body.get('model', SERVED), 'system_fingerprint': system_fingerprint(),
+            'service_tier': body.get('service_tier') or 'default'}
 
     def usage():  # the prompt is billed once (OpenAI), completions summed over the choices
         p, c = stats[0].get('prompt_tokens', 0), sum(s.get('completion_tokens', 0) for s in stats)
+        det = {'reasoning_tokens': sum(s.get('reasoning_tokens', 0) for s in stats)}
+        if body.get('prediction'):
+            det.update({k: sum(s.get(k, 0) for s in stats) for k in ('accepted_prediction_tokens', 'rejected_prediction_tokens')})
         return {'prompt_tokens': p, 'completion_tokens': c, 'total_tokens': p + c,
-                'prompt_tokens_details': {'cached_tokens': stats[0].get('cached_tokens', 0)}}
+                'prompt_tokens_details': {'cached_tokens': stats[0].get('cached_tokens', 0)}, 'completion_tokens_details': det}
 
-    def tool_calls(i):
-        return [{'id': f'call_{uuid.uuid4().hex[:24]}', 'type': 'function', 'function': tc}
-                for tc in stats[i].get('tool_calls') or []]
+    def call_entry(tc, cid=None):
+        cid = cid or f'call_{uuid.uuid4().hex[:24]}'
+        if tc['name'] in run.custom:
+            return {'id': cid, 'type': 'custom', 'custom': {'name': tc['name'], 'input': custom_input(tc)}}
+        return {'id': cid, 'type': 'function', 'function': tc}
 
     def finish(i):
-        return 'tool_calls' if stats[i].get('tool_calls') else stats[i].get('finish_reason', 'stop')
+        if stats[i].get('tool_calls'):
+            return 'function_call' if legacy else 'tool_calls'
+        return stats[i].get('finish_reason', 'stop')
 
     if not body.get('stream'):
-        async def watch():  # (only streams get cancelled by Starlette: a non-stream client that hangs up frees its slot)
-            while not cancel.is_set():
-                if await request.is_disconnected():
-                    cancel.set()
-                    return
-                await asyncio.sleep(1.0)
-        watcher = asyncio.create_task(watch())
+        watcher = asyncio.create_task(watch(request, cancel))
         text, reasoning, lps = ([[] for _ in reqs] for _ in range(3))
         try:
             async for i, kind, val in events():
-                if kind == 'delta':
+                if kind == 'delta' and val[0] in ('reasoning', 'content'):  # (calls: from the stats at the end)
                     (reasoning if val[0] == 'reasoning' else text)[i].append(val[1])
                     lps[i] += val[2] if len(val) > 2 else []
                 elif kind in ('bad', 'error', 'oom'):
@@ -662,13 +860,16 @@ async def completions(request: Request):
             watcher.cancel()
         choices = []
         for i in range(len(reqs)):
-            msg = {'role': 'assistant', 'content': ''.join(text[i]), 'reasoning_content': ''.join(reasoning[i]) or None}
-            if stats[i].get('tool_calls'):
-                msg['tool_calls'] = tool_calls(i)
+            msg = {'role': 'assistant', 'content': ''.join(text[i]), 'reasoning_content': ''.join(reasoning[i]) or None,
+                   'refusal': None}
+            calls = stats[i].get('tool_calls') or []
+            if calls and legacy:
+                msg['function_call'] = calls[0]
+            elif calls:
+                msg['tool_calls'] = [call_entry(tc) for tc in calls]
             choices.append({'index': i, 'message': msg, 'logprobs': {'content': lps[i]} if want_lp else None,
                             'finish_reason': finish(i)})
-        out = {'id': rid, 'object': 'chat.completion', 'created': created, 'model': body.get('model', SERVED),
-               'choices': choices, 'usage': usage()}
+        out = dict(head, object='chat.completion', choices=choices, usage=usage())
         if want_tm:
             out['timings'] = [timings(s) for s in stats]
         return out
@@ -679,29 +880,578 @@ async def completions(request: Request):
         c = {'index': i, 'delta': delta, 'finish_reason': fin}
         if want_lp:
             c['logprobs'] = {'content': lp} if lp else None
-        return 'data: ' + json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created,
-                                      'model': body.get('model', SERVED), 'choices': [c]}) + '\n\n'
+        return 'data: ' + json.dumps(dict(head, object='chat.completion.chunk', choices=[c])) + '\n\n'
+
+    open_call, n_calls = [None] * len(reqs), [0] * len(reqs)  # per choice: the streaming call, calls so far
+
+    def call_delta(i, kind, val):
+        """A call_* delta of choice i -> the chunk's delta dict (None: nothing to send yet)."""
+        c = open_call[i]
+        if kind == 'call_start':
+            c = open_call[i] = {'id': f'call_{uuid.uuid4().hex[:24]}', 'custom': val in run.custom, 'dec': CustomInput()}
+            body_ = {'name': val, 'input' if c['custom'] else 'arguments': ''}
+            if legacy:
+                return {'function_call': body_}
+            return {'tool_calls': [{'index': n_calls[i], 'id': c['id'], 'type': 'custom' if c['custom'] else 'function',
+                                    'custom' if c['custom'] else 'function': body_}]}
+        if kind == 'call_args':
+            d = c['dec'].feed(val) if c['custom'] else val
+        else:  # call_end
+            open_call[i], n_calls[i] = None, n_calls[i] + 1
+            if c is None:  # parsed at its end: the whole call at once
+                return {'function_call': val} if legacy else {'tool_calls': [dict(call_entry(val), index=n_calls[i] - 1)]}
+            d = c['dec'].finish(custom_input(val)) if c['custom'] else ''
+            if not d:
+                return None
+        if legacy:
+            return {'function_call': {'arguments': d}}
+        return {'tool_calls': [{'index': n_calls[i] - (kind == 'call_end'),
+                                'custom' if c['custom'] else 'function': {'input' if c['custom'] else 'arguments': d}}]}
 
     async def sse():
         for i in range(len(reqs)):
-            yield chunk(i, {'role': 'assistant', 'content': ''})
+            yield chunk(i, {'role': 'assistant', 'content': '', 'refusal': None})
         async for i, kind, val in events():
-            if kind == 'delta':
+            if kind == 'delta' and val[0] in ('reasoning', 'content'):
                 yield chunk(i, {'reasoning_content' if val[0] == 'reasoning' else 'content': val[1]},
                             lp=val[2] if len(val) > 2 else None)
+            elif kind == 'delta':
+                if (d := call_delta(i, val[0], val[1])) is not None:
+                    yield chunk(i, d)
             elif kind in ('bad', 'error', 'oom'):
                 yield 'data: ' + json.dumps({'error': {'message': val, 'code': {'bad': 400, 'oom': 503}.get(kind, 500)}}) + '\n\n'
                 break
             else:
-                if stats[i].get('tool_calls'):
-                    yield chunk(i, {'tool_calls': [dict(tc, index=j) for j, tc in enumerate(tool_calls(i))]})
                 yield chunk(i, {}, finish(i))
         else:
             if include_usage:
-                yield 'data: ' + json.dumps({'id': rid, 'object': 'chat.completion.chunk', 'created': created,
-                                             'model': body.get('model', SERVED), 'choices': [], 'usage': usage(),
-                                             **({'timings': [timings(s) for s in stats]} if want_tm else {})}) + '\n\n'
+                yield 'data: ' + json.dumps(dict(head, object='chat.completion.chunk', choices=[], usage=usage(),
+                                                 **({'timings': [timings(s) for s in stats]} if want_tm else {}))) + '\n\n'
         yield 'data: [DONE]\n\n'
+
+    return StreamingResponse(sse(), media_type='text/event-stream')
+
+
+# Legacy /v1/completions: raw prompts, no chat template (the model is chat-tuned: a raw prompt continues as plain text
+# to its end-of-message). Sampling parameters as chat. suffix (insertion) and prompt logprobs (echo + logprobs) aren't
+# supported: the model has no insertion training, and prefill keeps no per-position logits.
+COMPL_PASS = ('model', 'stream', 'stream_options', 'temperature', 'top_p', 'seed', 'stop', 'presence_penalty',
+              'frequency_penalty', 'logit_bias', 'user', 'priority', 'extra_body', 'spec', 'top_k', 'min_p',
+              'repetition_penalty', 'min_tokens', 'stop_token_ids')
+MAX_PROMPTS = 16
+
+
+def compl_prompts(p):
+    """prompt (a string, strings, token ids, lists of token ids) -> [(ids, text)]."""
+    tok_ok = lambda x: isinstance(x, list) and x and all(isinstance(t, int) and 0 <= t < grammar.VOCAB and
+                                                         t != chat.IMG_TOK for t in x)
+    if isinstance(p, str) or tok_ok(p):
+        p = [p]
+    if not isinstance(p, list) or not p or len(p) > MAX_PROMPTS:
+        raise BadRequest(f'prompt must be a string, a list of up to {MAX_PROMPTS} strings, or token id list(s)')
+    out = []
+    for x in p:
+        if isinstance(x, str) and x:
+            out.append((eng.tok.encode(x, add_special_tokens=False).ids, x))
+        elif tok_ok(x):
+            out.append((x, eng.tok.decode(x, skip_special_tokens=False)))
+        else:
+            raise BadRequest('each prompt must be a non-empty string or a list of valid token ids')
+    return out
+
+
+def compl_logprobs(ents, offset):
+    """Chat logprob entries -> the completions format (tokens, token_logprobs, top_logprobs, text_offset)."""
+    offs = []
+    for e in ents:
+        offs.append(offset)
+        offset += len(e['token'])
+    return {'tokens': [e['token'] for e in ents], 'token_logprobs': [e['logprob'] for e in ents],
+            'top_logprobs': [{t['token']: t['logprob'] for t in e.get('top_logprobs') or []} for e in ents],
+            'text_offset': offs}
+
+
+@app.post('/v1/completions')
+async def text_completions(request: Request):
+    t_arr = time.time()
+    try:
+        body = await request.json()
+    except ValueError:
+        return err(400, 'body is not JSON')
+    if not isinstance(body, dict):
+        return err(400, 'body must be an object')
+    try:
+        prompts = compl_prompts(body.get('prompt'))
+        n = int(body.get('n') or 1)
+        best = int(body.get('best_of') or n)
+        lpn, echo, stream = body.get('logprobs'), bool(body.get('echo')), bool(body.get('stream'))
+        if body.get('suffix'):
+            raise BadRequest('suffix (insertion) is not supported')
+        if not 1 <= n <= best <= MAX_N:
+            raise BadRequest(f'need 1 <= n <= best_of <= {MAX_N}')
+        if stream and best > n:
+            raise BadRequest('best_of > n cannot stream')
+        if lpn is not None and (isinstance(lpn, bool) or not isinstance(lpn, int) or not 0 <= lpn <= 20):
+            raise BadRequest('logprobs must be an integer 0..20')
+        if echo and lpn is not None:
+            raise BadRequest('echo with logprobs (prompt logprobs) is not supported')
+    except (BadRequest, TypeError, ValueError) as e:
+        return err(400, str(e))
+    cb = {k: body[k] for k in COMPL_PASS if k in body}
+    cb.update(messages=[], n=best, max_tokens=body.get('max_tokens') or 16)  # (OpenAI's default for this endpoint)
+    if lpn is not None or best > n:  # (best_of ranks candidates by their mean token logprob)
+        cb.update(logprobs=True, top_logprobs=lpn or 0)
+    rid, created = 'cmpl-' + uuid.uuid4().hex[:24], int(time.time())
+    run = await submit(cb, t_arr, prompts=[ids for ids, _ in prompts])
+    if isinstance(run, JSONResponse):
+        return run
+    stats = run.stats
+    head = {'id': rid, 'object': 'text_completion', 'created': created, 'model': body.get('model', SERVED),
+            'system_fingerprint': system_fingerprint()}
+    pre = lambda i: prompts[i // best][1] if echo else ''
+
+    def usage():  # every prompt and every candidate is billed (best_of included)
+        p = sum(stats[k * best].get('prompt_tokens', 0) for k in range(len(prompts)))
+        c = sum(s.get('completion_tokens', 0) for s in stats)
+        return {'prompt_tokens': p, 'completion_tokens': c, 'total_tokens': p + c}
+
+    if not stream:
+        watcher = asyncio.create_task(watch(request, run.cancel))
+        text, lps = ([[] for _ in run.reqs] for _ in range(2))
+        try:
+            async for i, kind, val in run.events():
+                if kind == 'delta' and val[0] == 'content':
+                    text[i].append(val[1])
+                    lps[i] += val[2] if len(val) > 2 else []
+                elif kind in ('bad', 'error', 'oom'):
+                    return err({'bad': 400, 'oom': 503}.get(kind, 500), val)
+        finally:
+            watcher.cancel()
+        choices = []
+        for k in range(len(prompts)):
+            cand = list(range(k * best, (k + 1) * best))
+            if best > n:
+                cand = sorted(cand, key=lambda i: -sum(e['logprob'] for e in lps[i]) / max(len(lps[i]), 1))[:n]
+            for i in cand:
+                choices.append({'text': pre(i) + ''.join(text[i]), 'index': len(choices),
+                                'logprobs': compl_logprobs(lps[i], len(pre(i))) if lpn is not None else None,
+                                'finish_reason': stats[i].get('finish_reason', 'stop')})
+        return dict(head, choices=choices, usage=usage())
+
+    offs = [len(pre(i)) for i in range(len(run.reqs))]
+
+    def chunk(i, text, lp=None, fin=None):
+        c = {'text': text, 'index': i, 'logprobs': None, 'finish_reason': fin}
+        if lpn is not None and lp:
+            c['logprobs'] = compl_logprobs(lp, offs[i])
+            offs[i] += sum(len(e['token']) for e in lp)
+        return 'data: ' + json.dumps(dict(head, choices=[c])) + '\n\n'
+
+    async def sse():
+        for i in range(len(run.reqs)):
+            if echo:
+                yield chunk(i, pre(i))
+        async for i, kind, val in run.events():
+            if kind == 'delta' and val[0] == 'content':
+                yield chunk(i, val[1], val[2] if len(val) > 2 else None)
+            elif kind in ('bad', 'error', 'oom'):
+                yield 'data: ' + json.dumps({'error': {'message': val, 'code': {'bad': 400, 'oom': 503}.get(kind, 500)}}) + '\n\n'
+                break
+            elif kind != 'delta':
+                yield chunk(i, '', fin=stats[i].get('finish_reason', 'stop'))
+        else:
+            if (body.get('stream_options') or {}).get('include_usage'):
+                yield 'data: ' + json.dumps(dict(head, choices=[], usage=usage())) + '\n\n'
+        yield 'data: [DONE]\n\n'
+
+    return StreamingResponse(sse(), media_type='text/event-stream')
+
+
+# OpenAI Responses API, stateless: each request carries the whole conversation in `input` (LiteLLM's Anthropic
+# /v1/messages bridge works this way). Stored responses (previous_response_id, conversation, background, GET by id)
+# are rejected; hosted tools are dropped. The request is mapped to a chat body and runs the chat path (function and
+# custom tools, allowed_tools, json_schema, logprobs); truncation 'auto' drops the oldest turns; /input_tokens counts.
+RESP_PASS = ('model', 'stream', 'temperature', 'top_p', 'parallel_tool_calls', 'seed', 'priority', 'extra_body', 'spec',
+             'top_k', 'min_p', 'presence_penalty', 'frequency_penalty', 'repetition_penalty', 'logit_bias', 'stop',
+             'chat_template_kwargs')  # (the last ones are non-standard here, as in our chat API)
+RESP_STATEFUL = ('previous_response_id', 'conversation', 'background', 'prompt')
+TEXT_PARTS = ('input_text', 'output_text', 'text', 'summary_text', 'reasoning_text')
+
+
+def resp_parts(c):
+    """Responses content (string or parts) -> chat content."""
+    if isinstance(c, str):
+        return c
+    if not isinstance(c, list):
+        raise BadRequest('content must be a string or a list of parts')
+    out = []
+    for p in c:
+        t = p.get('type') if isinstance(p, dict) else None
+        if t in TEXT_PARTS or t == 'refusal':
+            out.append({'type': 'text', 'text': p.get('text', p.get('refusal')) or ''})
+        elif t == 'input_image':
+            if not p.get('image_url'):
+                raise BadRequest('input_image needs image_url (file_id is not supported)')
+            out.append({'type': 'image_url', 'image_url': p['image_url']})
+        else:
+            raise BadRequest(f'unsupported content part type {t!r}')
+    return out
+
+
+def resp_to_chat(body):
+    """Responses request body -> chat completions body (BadRequest if it can't be mapped)."""
+    bad = [k for k in RESP_STATEFUL if body.get(k) not in (None, False)]
+    if bad:
+        raise BadRequest(f'unsupported parameter(s): {", ".join(bad)} (stateless: send the whole conversation as input)')
+    if body.get('truncation') not in (None, 'disabled', 'auto'):
+        raise BadRequest("truncation must be 'auto' or 'disabled'")
+    msgs =[{'role': 'system', 'content': body['instructions']}] if body.get('instructions') else []
+    inp = body.get('input')
+    inp = [{'type': 'message', 'role': 'user', 'content': inp}] if isinstance(inp, str) else inp
+    if not isinstance(inp, list) or not inp:
+        raise BadRequest('input must be a string or a non-empty list of items')
+    cur = None  # the assistant turn being assembled: reasoning, text, then calls (chat.render's order)
+
+    def turn(stage):  # a later item of an earlier stage starts a new assistant turn
+        nonlocal cur
+        if cur is None or cur['stage'] > stage:
+            cur = {'role': 'assistant', 'content': '', 'stage': stage}
+            msgs.append(cur)
+        cur['stage'] = stage
+        return cur
+    for it in inp:
+        if not isinstance(it, dict):
+            raise BadRequest('input items must be objects')
+        t = it.get('type', 'message')
+        if t == 'reasoning':  # the full text: our encrypted_content, else the raw content, else the summary
+            text = dec_reasoning(it.get('encrypted_content'))  # (another model's encrypted_content: dropped)
+            if text is None:
+                text = ''.join(p.get('text', '') for p in (it.get('content') or it.get('summary') or [])
+                               if isinstance(p, dict) and p.get('type') in TEXT_PARTS)
+            if text:
+                m = turn(0)
+                m['reasoning_content'] = m.get('reasoning_content', '') + text
+        elif t == 'message' and it.get('role') == 'assistant':
+            c = resp_parts(it.get('content'))
+            turn(1)['content'] += c if isinstance(c, str) else ''.join(p.get('text', '') for p in c)
+        elif t == 'function_call':
+            if not isinstance(it.get('name'), str) or not it['name']:
+                raise BadRequest('function_call needs a name')
+            turn(2).setdefault('tool_calls', []).append(
+                {'id': it.get('call_id'), 'type': 'function',
+                 'function': {'name': it['name'], 'arguments': it.get('arguments') or '{}'}})
+        elif t == 'custom_tool_call':
+            if not isinstance(it.get('name'), str) or not it['name']:
+                raise BadRequest('custom_tool_call needs a name')
+            turn(2).setdefault('tool_calls', []).append(
+                {'id': it.get('call_id'), 'type': 'custom', 'custom': {'name': it['name'], 'input': it.get('input', '')}})
+        elif t in ('function_call_output', 'custom_tool_call_output'):
+            cur = None
+            msgs.append({'role': 'tool', 'tool_call_id': it.get('call_id'), 'content': resp_parts(it.get('output', ''))})
+        elif t == 'message':
+            if it.get('role') not in ('user', 'system', 'developer'):
+                raise BadRequest(f'unknown message role {it.get("role")!r}')
+            cur = None
+            msgs.append({'role': it['role'], 'content': resp_parts(it.get('content'))})
+        else:
+            raise BadRequest(f'unsupported input item type {t!r}')
+    for m in msgs:
+        m.pop('stage', None)
+    chat_body = {k: body[k] for k in RESP_PASS if k in body}
+    chat_body['messages'] = msgs
+    # function + custom tools in chat form; hosted tools (web search, file search, ...) are dropped: the model just
+    # doesn't see them (a 400 would fail every turn of a client that always declares one, e.g. web_search_preview from
+    # LiteLLM's Anthropic bridge). max_tool_calls caps hosted tool calls only, so it has nothing to cap here.
+    keys = ('name', 'description', 'parameters', 'format')
+    as_chat = lambda t: {'type': t['type'], t['type']: {k: t[k] for k in keys if k in t}}
+    tools = [as_chat(t) for t in body.get('tools') or [] if isinstance(t, dict) and t.get('type') in ('function', 'custom')]
+    if tools:
+        chat_body['tools'] = tools
+    tc = body.get('tool_choice')
+    if isinstance(tc, dict) and tc.get('type') == 'allowed_tools':
+        tc = {'type': 'allowed_tools', 'allowed_tools': {'mode': tc.get('mode', 'auto'), 'tools': [
+            as_chat(t) for t in tc.get('tools') or [] if isinstance(t, dict) and t.get('type') in ('function', 'custom')]}}
+    elif isinstance(tc, dict):
+        if tc.get('type') not in ('function', 'custom') or not tc.get('name'):
+            raise BadRequest('tool_choice must be auto, none, required, allowed_tools or a function / custom tool')
+        tc = as_chat(tc)
+    if tc is not None:
+        chat_body['tool_choice'] = tc
+    if 'message.output_text.logprobs' in (body.get('include') or []) or body.get('top_logprobs'):
+        chat_body.update(logprobs=True, top_logprobs=body.get('top_logprobs') or 0)
+    fmt = (body.get('text') or {}).get('format') or {}
+    if fmt.get('type') == 'json_schema':
+        chat_body['response_format'] = {'type': 'json_schema', 'json_schema': {
+            'name': fmt.get('name', 'output'), 'schema': fmt.get('schema'), 'strict': fmt.get('strict')}}
+    elif fmt.get('type') not in (None, 'text'):
+        chat_body['response_format'] = {'type': fmt['type']}  # json_object (anything else: compile_format says no)
+    effort = (body.get('reasoning') or {}).get('effort')
+    if effort is not None:
+        chat_body['reasoning_effort'] = effort
+    if body.get('max_output_tokens') is not None:
+        chat_body['max_tokens'] = body['max_output_tokens']
+    return chat_body
+
+
+ENC_PRE = 'ink1:'  # our reasoning items' encrypted_content: opaque, not secret (base64 of the client's own reasoning)
+
+
+def enc_reasoning(text):
+    return ENC_PRE + base64.b64encode(text.encode('utf-8')).decode('ascii')
+
+
+def dec_reasoning(s):
+    """Our encrypted_content -> the reasoning text; None for another model's (dropped)."""
+    if not isinstance(s, str) or not s.startswith(ENC_PRE):
+        return None
+    try:
+        return base64.b64decode(s[len(ENC_PRE):], validate=True).decode('utf-8')
+    except ValueError:
+        raise BadRequest('reasoning item: bad encrypted_content')
+
+
+class RespOut:
+    """Engine deltas -> Responses output items, plus the stream events that build them (the non-stream path drops
+    the events). Reasoning: the raw text always goes in the item's content (reasoning_text); `summary` only when the
+    request asks for one (reasoning.summary; there's no summarizer, so it's the same full text); include
+    reasoning.encrypted_content adds it as encrypted_content (ENC_PRE), which carries the full reasoning to the next turn
+    through clients that keep only that (LiteLLM's Anthropic bridge: a thinking block's signature)."""
+
+    def __init__(self, custom=(), summary=False, enc=False):
+        self.items, self.cur, self.acc, self.lps, self.custom, self.cs = [], None, '', [], custom, None
+        self.summary, self.enc = summary, enc
+
+    def _ev(self, type, **kw):
+        return dict(type=type, output_index=len(self.items) - 1, **kw)
+
+    def delta(self, kind, text, lp=()):
+        lp = list(lp or ())
+        if not text and not (lp and self.cur and self.cur['type'] == 'message'):
+            return []  # (an empty content delta: no empty message item; one carrying held-back logprobs joins the open one)
+        ev = []
+        want = 'reasoning' if kind == 'reasoning' else 'message'
+        if self.cur is None or self.cur['type'] != want:
+            ev += self.close()
+            if want == 'reasoning':
+                self.cur = {'id': 'rs_' + uuid.uuid4().hex[:24], 'type': 'reasoning', 'summary': [], 'content': []}
+                self.items.append(self.cur)
+                ev += [self._ev('response.output_item.added', item=dict(self.cur)),
+                       self._ev('response.content_part.added', item_id=self.cur['id'], content_index=0,
+                                part={'type': 'reasoning_text', 'text': ''})]
+                if self.summary:
+                    ev.append(self._ev('response.reasoning_summary_part.added', item_id=self.cur['id'], summary_index=0,
+                                       part={'type': 'summary_text', 'text': ''}))
+            else:
+                self.cur = {'id': 'msg_' + uuid.uuid4().hex[:24], 'type': 'message', 'status': 'in_progress',
+                            'role': 'assistant', 'content': []}
+                self.items.append(self.cur)
+                ev += [self._ev('response.output_item.added', item=dict(self.cur)),
+                       self._ev('response.content_part.added', item_id=self.cur['id'], content_index=0,
+                                part={'type': 'output_text', 'text': '', 'annotations': []})]
+        self.acc += text
+        if want == 'reasoning':
+            ev.append(self._ev('response.reasoning_text.delta', item_id=self.cur['id'], content_index=0, delta=text))
+            if self.summary:
+                ev.append(self._ev('response.reasoning_summary_text.delta', item_id=self.cur['id'], summary_index=0,
+                                   delta=text))
+        else:
+            self.lps += lp
+            ev.append(self._ev('response.output_text.delta', item_id=self.cur['id'], content_index=0, delta=text,
+                               logprobs=lp))
+        return ev
+
+    def close(self):
+        c, text, lps, self.cur, self.acc, self.lps = self.cur, self.acc, self.lps, None, '', []
+        if c is None or c['type'] not in ('reasoning', 'message'):  # (a call left open: the stream ended inside it)
+            self.cs = None
+            return []
+        i = dict(item_id=c['id'], output_index=self.items.index(c))
+        if c['type'] == 'reasoning':
+            raw = {'type': 'reasoning_text', 'text': text}
+            c['content'] = [raw]
+            ev = [dict(type='response.reasoning_text.done', content_index=0, text=text, **i),
+                  dict(type='response.content_part.done', content_index=0, part=raw, **i)]
+            if self.summary:
+                part = {'type': 'summary_text', 'text': text}
+                c['summary'] = [part]
+                ev += [dict(type='response.reasoning_summary_text.done', summary_index=0, text=text, **i),
+                       dict(type='response.reasoning_summary_part.done', summary_index=0, part=part, **i)]
+            if self.enc:
+                c['encrypted_content'] = enc_reasoning(text)
+        else:
+            part = {'type': 'output_text', 'text': text, 'annotations': [], 'logprobs': lps}
+            c.update(status='completed', content=[part])
+            ev = [dict(type='response.output_text.done', content_index=0, text=text, logprobs=lps, **i),
+                  dict(type='response.content_part.done', content_index=0, part=part, **i)]
+        return ev + [dict(type='response.output_item.done', output_index=i['output_index'], item=c)]
+
+    def call(self, kind, val):
+        """A parser call_* delta -> events. A streamed call opens its item at call_start and sends argument (custom:
+        decoded input) deltas; one parsed only at its end goes out whole at call_end."""
+        ev = []
+        if kind == 'call_start' or (kind == 'call_end' and self.cs is None):
+            ev += self.close()
+            name = val if kind == 'call_start' else val['name']
+            custom = name in self.custom
+            t, field = ('custom_tool_call', 'input') if custom else ('function_call', 'arguments')
+            self.cur = {'id': ('ctc_' if custom else 'fc_') + uuid.uuid4().hex[:24], 'type': t, 'status': 'in_progress',
+                        'call_id': 'call_' + uuid.uuid4().hex[:24], 'name': name, field: ''}
+            self.items.append(self.cur)
+            ev.append(self._ev('response.output_item.added', item=dict(self.cur)))
+            self.cs = CustomInput()  # (the open call's input decoder; function calls just use its presence)
+            if kind == 'call_start':
+                return ev
+        it = self.cur
+        custom, field = it['type'] == 'custom_tool_call', 'input' if it['type'] == 'custom_tool_call' else 'arguments'
+        if kind == 'call_args':
+            d = self.cs.feed(val) if custom else val
+        else:
+            final = custom_input(val) if custom else val['arguments']
+            d = self.cs.finish(final) if custom else final[len(it[field]):]
+        if d:
+            it[field] += d
+            ev.append(self._ev(f'response.{it["type"]}_{field}.delta', item_id=it['id'], delta=d))
+        if kind == 'call_end':
+            self.cs = None
+            it['status'] = 'completed'
+            ev += [self._ev(f'response.{it["type"]}_{field}.done', item_id=it['id'], **{field: it[field]},
+                            **({} if custom else {'name': it['name']})),
+                   self._ev('response.output_item.done', item=dict(it))]
+            self.cur = None
+        return ev
+
+
+def prompt_len(cb, msgs=None, memo=None):
+    """Chat body (messages: msgs if given) -> prompt length in tokens as the engine renders it (images sized from
+    their headers)."""
+    tools, _, _ = chat_tools(cb)
+    effort, no_think = effort_of(cb)
+    n = eng.count(chat_messages(cb['messages'] if msgs is None else msgs), tools, effort, memo)
+    return n + 2 * (no_think and not tools)  # (thinking off: the pre-filled answer header)
+
+
+def fit(cb):
+    """truncation 'auto': the messages without the fewest oldest turns (a user or assistant message plus the tool
+    results after it; system / developer messages stay) such that prompt + max_tokens fits the context. The last turn
+    always stays (if even that doesn't fit, the engine's 400 says so)."""
+    msgs, mt, memo = cb['messages'], int(cb.get('max_tokens') or DEFAULT_MAX_TOKENS), {}
+    starts = [i for i, m in enumerate(msgs) if m.get('role') in ('user', 'assistant')]
+    without = lambda k: msgs if k == 0 else \
+        [m for i, m in enumerate(msgs) if i >= starts[k] or m.get('role') in ('system', 'developer')]
+    ok = lambda k: prompt_len(cb, without(k), memo) + mt <= eng.max_ctx
+    if len(starts) < 2 or ok(0):
+        return msgs
+    lo, hi = 1, len(starts) - 1  # smallest k that fits (binary search: each try renders the whole prompt)
+    if not ok(hi):
+        return without(hi)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        lo, hi = (lo, mid) if ok(mid) else (mid + 1, hi)
+    return without(lo)
+
+
+async def resp_body(request):
+    """-> (Responses body, chat body with truncation applied) or an error response."""
+    try:
+        body = await request.json()
+    except ValueError:
+        return err(400, 'body is not JSON'), None
+    if not isinstance(body, dict):
+        return err(400, 'body must be an object'), None
+    try:
+        cb = resp_to_chat(body)
+        if body.get('truncation') == 'auto':
+            cb['messages'] = await asyncio.get_running_loop().run_in_executor(None, fit, cb)
+    except (BadRequest, TypeError, ValueError, AttributeError) as e:
+        return err(400, str(e)), None
+    return body, cb
+
+
+@app.post('/v1/responses/input_tokens')
+async def input_tokens(request: Request):
+    body, cb = await resp_body(request)
+    if cb is None:
+        return body
+    try:
+        n = await asyncio.get_running_loop().run_in_executor(None, prompt_len, cb)
+    except (BadRequest, TypeError, ValueError) as e:
+        return err(400, str(e))
+    return {'object': 'response.input_tokens', 'input_tokens': n}
+
+
+@app.post('/v1/responses')
+async def responses(request: Request):
+    t_arr = time.time()
+    body, chat_body = await resp_body(request)
+    if chat_body is None:
+        return body
+    rid, created = 'resp_' + uuid.uuid4().hex[:24], int(time.time())
+    run = await submit(chat_body, t_arr)
+    if isinstance(run, JSONResponse):
+        return run
+    st, out = run.stats[0], RespOut(run.custom, summary=(body.get('reasoning') or {}).get('summary') is not None,
+                                    enc='reasoning.encrypted_content' in (body.get('include') or []))
+
+    def response(status, error=None):
+        p, c = st.get('prompt_tokens', 0), st.get('completion_tokens', 0)
+        length = status == 'completed' and st.get('finish_reason') == 'length' and not st.get('tool_calls')
+        return {'id': rid, 'object': 'response', 'created_at': created, 'model': body.get('model', SERVED),
+                'status': 'incomplete' if length else status, 'error': error,
+                'incomplete_details': {'reason': 'max_output_tokens'} if length else None,
+                'output': out.items if status != 'in_progress' else [],
+                'usage': None if status == 'in_progress' else {
+                    'input_tokens': p, 'input_tokens_details': {'cached_tokens': st.get('cached_tokens', 0)},
+                    'output_tokens': c, 'output_tokens_details': {'reasoning_tokens': st.get('reasoning_tokens', 0)}, 'total_tokens': p + c},
+                'instructions': body.get('instructions'), 'max_output_tokens': body.get('max_output_tokens'),
+                'parallel_tool_calls': body.get('parallel_tool_calls', True), 'previous_response_id': None,
+                'reasoning': body.get('reasoning') or {'effort': None, 'summary': None}, 'store': False,
+                'temperature': body.get('temperature', 1.0), 'top_p': body.get('top_p', 1.0),
+                'text': body.get('text') or {'format': {'type': 'text'}}, 'tool_choice': body.get('tool_choice', 'auto'),
+                'tools': body.get('tools') or [], 'truncation': body.get('truncation') or 'disabled',
+                'top_logprobs': body.get('top_logprobs') or 0, 'max_tool_calls': body.get('max_tool_calls'),
+                'service_tier': body.get('service_tier') or 'default', 'metadata': body.get('metadata') or {},
+                'user': body.get('user')}
+
+    async def run_events():  # -> Responses events; ends with ('fail', code, message) on an engine error
+        async for _, kind, val in run.events():
+            if kind == 'delta':
+                evs = out.call(val[0], val[1]) if val[0].startswith('call_') else \
+                    out.delta(val[0], val[1], val[2] if len(val) > 2 else ())
+                for ev in evs:
+                    yield ev
+            elif kind in ('bad', 'error', 'oom'):
+                out.close()
+                yield ('fail', {'bad': 400, 'oom': 503}.get(kind, 500), val)
+            else:
+                for ev in out.close():
+                    yield ev
+
+    if not body.get('stream'):
+        watcher = asyncio.create_task(watch(request, run.cancel))
+        try:
+            async for ev in run_events():
+                if isinstance(ev, tuple):
+                    return err(ev[1], ev[2])
+        finally:
+            watcher.cancel()
+        return response('completed')
+
+    async def sse():
+        seq = itertools.count()
+
+        def put(ev):
+            ev['sequence_number'] = next(seq)
+            return f'event: {ev["type"]}\ndata: {json.dumps(ev)}\n\n'
+        yield put({'type': 'response.created', 'response': response('in_progress')})
+        yield put({'type': 'response.in_progress', 'response': response('in_progress')})
+        async for ev in run_events():
+            if isinstance(ev, tuple):
+                code = {400: 'invalid_request_error', 503: 'server_is_overloaded'}.get(ev[1], 'server_error')
+                yield put({'type': 'response.failed', 'response': response('failed', {'code': code, 'message': ev[2]})})
+                return
+            yield put(ev)
+        r = response('completed')
+        yield put({'type': 'response.' + r['status'], 'response': r})
 
     return StreamingResponse(sse(), media_type='text/event-stream')
 

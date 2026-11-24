@@ -117,7 +117,9 @@ def compile_tools(tok, tools, choice, think, parallel=True):
         n = choice['function'].get('name')
         if n not in names:
             raise ValueError(f'tool_choice names {n!r}, which is not in tools')
-        want = [n]
+        # one call, as OpenAI: with parallel calls the model went on to the other tools it wanted, and every one was
+        # forced into this name (copies of the call, or its args holding the other tools' names)
+        return Tools(tok, tools, [n], think, parallel=False)
     else:
         raise ValueError(f'unknown tool_choice {choice!r}')
     return Tools(tok, tools, want, think, parallel)
@@ -150,8 +152,8 @@ class ToolCall:
 
     def mask(self, logits):
         s = self.state
-        if s == 'free':
-            pass
+        if s == 'free':  # a call starts only through MODEL + a declared name (lhead): else, after MODEL MODEL name or
+            logits[chat.INVOKE_JSON] = float('-inf')  # right after an END, it would call any tool the model made up
         elif s == 'json':
             mask_rows(logits[None], [self])
         elif s == 'lhead':

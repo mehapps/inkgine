@@ -907,7 +907,7 @@ def test_engine_wiring():
     real_fv = E.free_vram
     E.free_vram = lambda need=None, **kw: needs.append(need) or real_fv(need, **kw)
     req = SimpleNamespace(spec=None, need=100, temperature=0.7, top_p=1.0, top_k=0, gen=torch.Generator(), cons=None,
-                          prefill_text=True, prompt=[1, 2], P=0, min_p=0.05, proc=True, seed=7)
+                          prefill_text=True, prompt=[1, 2], P=0, min_p=0.05, proc=True, seed=7, pred=[], stats={})
     for fp8 in (True, False):
         q8, s8 = quant_w(W['unembed.weight'])
         E.model = SimpleNamespace(dev=torch.device('cpu'), W=W, d8=SimpleNamespace(dec=fp8, un=(q8, s8)))
@@ -1037,7 +1037,7 @@ def test_long_ctx_spec():
         r.__dict__.update(
             ids=ids, prompt=ids, pre=[], out=[5], keys=torch.tensor(ids), need=n_ids, spec=spec, oomed=False,
             temperature=0.0, top_p=1.0, top_k=0, gen=torch.Generator(), cons=None, prefill_text=True, min_p=0.0, seed=7,
-            sp=None, slot=None, seq=None, P=0)
+            sp=None, slot=None, seq=None, P=0, pred=[], stats={})
         return r
     try:
         E.mem_free = lambda: 1 << 62

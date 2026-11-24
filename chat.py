@@ -96,6 +96,8 @@ def render(tok, messages, tools=None, effort=0.9, image_tokens=None):
                     put([r, TEXT], enc(p['text']), [END])
                 elif p.get('type') in ('image_url', 'image') and role == 'user':
                     ids += [r, IMAGE] + [IMG_TOK] * image_tokens(p) + [END]
+                else:  # (images: user and tool messages only, SPEC §1; as OpenAI)
+                    raise ValueError(f'unsupported content part {p.get("type")!r} in a {role} message')
         elif role == 'tool':
             name = m.get('name') or call_names.get(m.get('tool_call_id'), '')
             for p in parts:
@@ -103,6 +105,8 @@ def render(tok, messages, tools=None, effort=0.9, image_tokens=None):
                     put([TOOL], enc(name), [TEXT], enc(p['text']), [END])
                 elif p.get('type') in ('image_url', 'image'):
                     put([TOOL], enc(name), [IMAGE], [IMG_TOK] * image_tokens(p), [END])
+                else:
+                    raise ValueError(f'unsupported content part {p.get("type")!r} in a tool message')
         elif role == 'assistant':
             text = ''.join(p.get('text', '') for p in parts if p.get('type') == 'text')
             rc = m.get('reasoning_content') or m.get('reasoning')
@@ -132,38 +136,81 @@ def call_body(name, args):
 
 
 class Parser:
-    """Incremental output parser. feed(id) -> list of (kind, text) deltas; kind in reasoning|content.
+    """Incremental output parser. feed(id) -> list of (kind, value) deltas: ('reasoning' | 'content', text), and for
+    tool calls ('call_start', name), ('call_args', text), ('call_end', {name, arguments}).
     Tool calls are collected in .tool_calls: the name is the header's (MODEL name INVOKE_JSON), else the body's "name";
     the args are the body's "args" (as rendered), else "arguments", else the whole body; no name or no object args ->
-    the body goes out as content. Text is decoded incrementally: only the body tokens after the last emitted
-    delta (byte-level BPE: a decode that doesn't end in U+FFFD ends on a whole character, so decode(a + b) ==
-    decode(a) + decode(b) there), not the whole message each token."""
+    the body goes out as content. A call written as rendered ({"name":"<header name>","args":...) streams its args text
+    as it's generated (call_start once the prefix is seen, then call_args; its arguments are then that exact text, so
+    the deltas add up to it); any other call is parsed at its END (call_end only). Text is decoded incrementally: only
+    the body tokens after the last emitted delta (byte-level BPE: a decode that doesn't end in U+FFFD ends on a whole
+    character, so decode(a + b) == decode(a) + decode(b) there), not the whole message each token."""
 
     def __init__(self, tok):
         self.tok, self.kind, self.body, self.sent, self.tool_calls = tok, None, [], 0, []  # sent: body tokens emitted
         self.name = []                                    # header name tokens of the current message
+        self.text, self.pre, self.apos = '', None, None   # tool body so far; streamed: args start / emitted up to
 
     def feed(self, t):
         if t == MODEL:
             self.kind, self.name = 'name', []; return []
         if t in CONTENT_KIND and self.kind in ('name', None):
-            self.kind, self.body, self.sent = CONTENT_KIND[t], [], 0; return []
+            self.kind, self.body, self.sent = CONTENT_KIND[t], [], 0
+            self.text, self.pre, self.apos = '', None, None; return []
         if t == END:
-            out = self._flush(final=True)
-            if self.kind == 'tool':
-                text = self.tok.decode(self.body, skip_special_tokens=False)
-                call = self._call(text)
-                if call is not None:
-                    self.tool_calls.append(call)
-                else:
-                    out.append(('content', text))
+            out = self._tool_end() if self.kind == 'tool' else self._flush(final=True)
             self.kind = None; return out
         if self.kind in ('reasoning', 'content', 'tool'):
             self.body.append(t)
-            return self._flush()
+            return self._tool_flush() if self.kind == 'tool' else self._flush()
         if self.kind == 'name' and t < USER:
             self.name.append(t)
         return []
+
+    def _hname(self):
+        return self.tok.decode(self.name, skip_special_tokens=False).strip()
+
+    def _tool_flush(self, final=False):
+        """Decode new tool-body tokens; once the body starts as rendered, stream the args (a trailing '}' is held: it
+        may be the one closing the call object)."""
+        d = self.tok.decode(self.body[self.sent:], skip_special_tokens=False)
+        if not final and d.endswith('�'):
+            return []
+        self.sent, self.text, out = len(self.body), self.text + d, []
+        if self.pre is None:
+            name = self._hname()
+            pre = '{"name":' + json.dumps(name, ensure_ascii=False) + ',"args":'
+            if name and self.text.startswith(pre):
+                self.pre = self.apos = len(pre)
+                out.append(('call_start', name))
+            elif not name or not pre.startswith(self.text):
+                self.pre = False  # written some other way: parsed at END
+        if self.pre and not final:
+            end = len(self.text) - self.text.endswith('}')
+            if end > self.apos:
+                out.append(('call_args', self.text[self.apos:end]))
+                self.apos = end
+        return out
+
+    def _tool_end(self):
+        out = self._tool_flush(final=True)
+        call = self._call(self.text)
+        if self.pre:  # streamed: arguments = the args text exactly (the deltas add up to it)
+            raw = self.text[self.pre:].rstrip()
+            raw = raw[:-1] if raw.endswith('}') else raw  # (the call object's own '}')
+            try:
+                same = call is not None and json.loads(raw) == json.loads(call['arguments'])
+            except ValueError:
+                same = False
+            if same or call is None:  # (None: cut short, e.g. max_tokens: the call ends with what was streamed)
+                call = {'name': self._hname(), 'arguments': raw}
+            if len(raw) > self.apos - self.pre:
+                out.append(('call_args', raw[self.apos - self.pre:]))
+        if call is None:
+            out.append(('content', self.text))
+            return out
+        self.tool_calls.append(call)
+        return out + [('call_end', call)]
 
     def _call(self, text):
         """Tool-call body -> {name, arguments} or None (not JSON, no name, args not an object)."""

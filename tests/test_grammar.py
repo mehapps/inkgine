@@ -107,15 +107,25 @@ def feed(c, ids, p=None):
 assert grammar.compile_tools(tok, AUTO, 'none', True) is None and grammar.compile_tools(tok, None, 'auto', True) is None
 c = grammar.ToolCall(grammar.compile_tools(tok, AUTO, 'auto', True))
 assert c.state == 'free' and not c.done
-# free text / reasoning / EOS: untouched (mask is a no-op outside a call)
+# free text / reasoning / EOS: untouched outside a call, except INVOKE_JSON (a call starts only through a declared name)
 g = torch.Generator().manual_seed(0)
 for ids in ([chat.MODEL, chat.THINK] + enc('Let me look.') + [chat.END, chat.MODEL, chat.TEXT] + enc('Sure: done.') +
             [chat.END],):
     for t in ids:
         lg = torch.randn(grammar.VOCAB, generator=g)
         if c.state != 'lhead':
-            assert torch.equal(c.mask(lg.clone()), lg), c.state
+            want = lg.clone()
+            want[chat.INVOKE_JSON] = float('-inf')
+            assert torch.equal(c.mask(lg.clone()), want), c.state
         c.accept(t)
+# the escapes (window 11-24: auto + one declared tool -> calls of search_emails / search_files the model made up):
+# MODEL MODEL name INVOKE_JSON, and INVOKE_JSON right after an END: both blocked
+for pre in ([chat.MODEL, chat.MODEL] + enc('search_emails'), [chat.MODEL, chat.TEXT] + enc('x') + [chat.END]):
+    e = grammar.ToolCall(grammar.compile_tools(tok, AUTO, 'auto', True))
+    for t in pre:
+        assert allowed(e, t), (pre, t, e.state)
+        e.accept(t)
+    assert e.state == 'free' and not allowed(e, chat.INVOKE_JSON), pre
 assert c.state == 'free' and allowed(c, chat.EOS) and not c.done
 # header: block types and the declared names' first tokens only (no nameless call, no other name)
 c.accept(chat.MODEL)
@@ -175,7 +185,11 @@ c = grammar.ToolCall(grammar.compile_tools(tok, AUTO, 'auto', True))
 sp = spec_runner.Spec(None, None, 0, lookup=Lookup([]), cons=c)
 txt = enc(' ok') + [chat.END]
 kept, bad, masks = sp._grammar(txt)
-assert kept == txt and bad is None and masks is None  # outside a call: no masks at all
+# outside a call: one fixed mask, INVOKE_JSON banned on every row, nothing else
+assert kept == txt and bad is None and masks is sp.gfree and torch.isinf(masks[:, chat.INVOKE_JSON]).all()
+assert torch.isfinite(masks[:, :chat.INVOKE_JSON]).all() and torch.isfinite(masks[:, chat.INVOKE_JSON + 1:]).all()
+kept, bad, _ = sp._grammar(txt[:1] + [chat.INVOKE_JSON] + txt[1:])  # a draft that would start a call there: cut
+assert kept == txt[:1] and bad == chat.INVOKE_JSON and c.state == 'free'
 call = [chat.MODEL] + enc('Read') + [chat.INVOKE_JSON] + enc('{"name":"Read","args":{"file_path":"/a"}}') + [chat.END]
 d = txt + call[:6]
 kept, bad, masks = sp._grammar(d)
@@ -196,8 +210,16 @@ kept, bad, _ = sp._grammar(two)
 assert kept == two and bad is None and c.m is m0 and c.state == s0
 feed(c, two + call[8:])  # m0 rolled back correctly: the same tokens are accepted for real
 assert c.state == 'free' and not c.done
-print('tool_choice auto + spec drafts: no masks outside calls, masks + rollback across the call start and into a '
-      'second call, device draft ids cut in host()')
+print('tool_choice auto + spec drafts: outside calls only INVOKE_JSON masked (fixed mask), masks + rollback across '
+      'the call start and into a second call, device draft ids cut in host()')
+# a named tool_choice ends the reply after its call, even with parallel calls on (no forced copies of it)
+n = grammar.ToolCall(grammar.compile_tools(tok, AUTO, {'type': 'function', 'function': {'name': 'Read'}}, False, True))
+feed(n, call)
+assert n.done
+r = grammar.ToolCall(grammar.compile_tools(tok, AUTO, 'required', False, True))
+feed(r, call)
+assert not r.done and r.state == 'free'  # (required: more calls may follow)
+print("named tool_choice: one call; required: parallel calls go on")
 
 # chat.Parser: name from the header, args from "args" / "arguments" / the whole body; never a nameless call
 
@@ -212,8 +234,8 @@ def parse(body, name='Bash'):
 want = [{'name': 'Bash', 'arguments': '{"command": "ls"}'}]
 for b in ('{"command":"ls"}', '{"name":"Bash","arguments":{"command":"ls"}}', '{"name":"Bash","arguments":"{\\"command\\":\\"ls\\"}"}',
           '{"args":{"command":"ls"},"name":"Bash"}', '{"args":{"command":"ls"},"name":"Other"}'):
-    assert parse(b) == (want, []), (b, parse(b))
-assert parse('{"args":{"command":"ls"},"name":"Bash"}', name='') == (want, [])  # body name as the fallback
+    assert parse(b) == (want, [('call_end', want[0])]), (b, parse(b))  # (not written as rendered: parsed at END)
+assert parse('{"args":{"command":"ls"},"name":"Bash"}', name='') == (want, [('call_end', want[0])])  # body name fallback
 for b in ('{"command":"ls"}', '{"name":"","args":{}}'):
     assert parse(b, name='') == ([], [('content', b)]), b  # no name anywhere: raw text, not an empty call
 assert parse('{"args":[1]}') == ([], [('content', '{"args":[1]}')]) and parse('{oops') == ([], [('content', '{oops')])

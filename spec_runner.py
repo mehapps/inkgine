@@ -98,8 +98,11 @@ class Spec:
 
     def __init__(self, ds, bd, slot, start=0, kmax=7, temperature=0.0, top_p=1.0, top_k=0, gen=None, cons=None,
                  stop=(chat.EOS,), times=None, st=None, lookup=None, vocab=None, dev=None, gate=None, accept_dev=None,
-                 min_p=0.0, hybrid=None, seed=None):
+                 min_p=0.0, hybrid=None, seed=None, pred=(), pstats=None):
+        # pred: a predicted output (ids) the copy drafter may copy from (lookup= gets it in its own Lookup(pre=));
+        # pstats: dict that gets accepted_prediction_tokens / rejected_prediction_tokens (drafts copied from pred)
         self.ds, self.bd, self.slot, self.lk, self.times = ds, bd, slot, lookup, times
+        self.pstats = pstats
         self.st = None
         if ds is not None:
             self.st = ds.new_state(start) if st is None else st  # st: a State to reuse (reset; keeps its graphs)
@@ -111,7 +114,7 @@ class Spec:
             self.gate = Gate(kmax, verify=times or VERIFY_MS)
         # hybrid: ids so far (filled from hist() at the first round, then kept in step), copy acceptance, verify ms
         # of T = 1..16 rows (a lookup round has no drafter cost)
-        self.hy = Lookup() if ds is not None and (HYBRID if hybrid is None else hybrid) else None
+        self.hy = Lookup(pre=pred) if ds is not None and (HYBRID if hybrid is None else hybrid) else None
         self.vbase = times or VERIFY_MS                   # verify-only ms per width (ctl.t minus the drafter)
         self.cpr, self.vt = Copy(), verify16(self.vbase)
         self.src = None                                   # this round: (DSpark drafts, copy bucket or None)
@@ -134,7 +137,7 @@ class Spec:
         self.conf = self.lg = self.dtok = None
         self.offrun, self.sleep_at = 0, None              # rounds in a row not worth drafting; dormant since pos
         self.dev_tok = getattr(bd, 'dev_tok', False) and ds is not None and self.gate is None
-        self.gm = None                                    # grammar masks of the verify rows [8, V] (lazy)
+        self.gm = self.gfree = None                       # grammar masks of the verify rows [8, V] (lazy)
         self.stats = dict(rounds=0, drafted=0, accepted=0, emitted=0,    # (rounds/emitted: drafting rounds only)
                           draft_s=0.0, step_s=0.0, settle_s=0.0,   # settle: waits for the verify + accepts
                           tried=[0] * RMAX, kept=[0] * RMAX,   # per draft position: drafted / accepted
@@ -184,6 +187,9 @@ class Spec:
         batch: requests in this decode step (Width weighs the step's total tokens/ms)."""
         st, self.dtok, self.src, self.lk_ok = self.st, None, None, False
         self.p0, self.nz = pos, {}
+        for lk in (self.lk, self.hy):
+            if lk is not None:
+                lk.from_pred = False  # (set again by a span copied from the prediction this round)
         if self.lk is not None:
             self.lk_ok = self._sync(self.lk, pos, last, hist)
         cp = self._copy(pos, last, left, kcap, hist) if self.hy is not None else None   # hybrid: best copy round
@@ -288,7 +294,7 @@ class Spec:
             lk.extend([last])
         elif len(lk) != pos + 1 and hist is not None:
             h = hist()
-            lk.L, lk.last = 0, None
+            lk.L, lk.last = lk.base, None  # (a prediction region before base stays)
             lk.extend(h)
         return len(lk) == pos + 1
 
@@ -388,6 +394,11 @@ class Spec:
         if b is not None and a >= kd:                     # the copied rows were reached
             self.cpr.update(b, len(d) - kd, a - kd)
         lk = self.lk if self.lk is not None else self.hy
+        if lk is not None and lk.from_pred and self.pstats is not None:  # copied rows came from the prediction
+            c0 = 0 if self.lk is not None else kd         # (lookup mode: the whole draft is the copy)
+            acc = max(0, min(a, len(d)) - c0)
+            for k_, v in (('accepted_prediction_tokens', acc), ('rejected_prediction_tokens', len(d) - c0 - acc)):
+                self.pstats[k_] = self.pstats.get(k_, 0) + v
         if lk is not None and self.lk_ok:
             lk.extend(d[:a])                              # committed drafts (last is already in)
         if self.short:
@@ -428,8 +439,11 @@ class Spec:
         rejected token or None, masks). The constraint is rolled back afterwards (settle() advances it by the emitted
         tokens)."""
         cons = self.cons
-        if cons.state == 'free' and isinstance(cons, ToolCall) and chat.MODEL not in d:
-            return d, None, None                          # tool_choice auto outside a call: no masks, no syncs
+        if cons.state == 'free' and isinstance(cons, ToolCall) and chat.MODEL not in d and chat.INVOKE_JSON not in d:
+            if self.gfree is None:                        # tool_choice auto outside a call: one fixed mask (every row
+                self.gfree = torch.zeros(RMAX + 1, self.V, device=self.dev)  # only bans INVOKE_JSON, ToolCall.mask's
+                self.gfree[:, chat.INVOKE_JSON] = float('-inf')               # 'free'), no per-round work, no syncs
+            return d, None, self.gfree
         if self.gm is None:
             self.gm = torch.zeros(RMAX + 1, self.V, device=self.dev)
         g = self.gm
