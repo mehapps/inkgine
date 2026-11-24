@@ -1,5 +1,5 @@
 """CPU, no model: server.Scheduler (continuous batching) against a fake step engine. Priority admission order, decode
-fairness, time share (+ VIP-aware), chunk size drop while decodes run, VIP preemption of a decode among several
+fairness, time share (+ VIP-aware), chunk size drop while decodes run, VIP waits for a slot (decodes never preempted)
 running (resumes with no gap/duplicate), head-of-line blocking, cancellation, NoRoom (waits while others run, gives up
 alone), solo mode, no page leak. FakeEngine is also used by test_sched.py / test_chat.py (HTTP level).
 Run: cd engine && PATH=$PWD/.venv/bin:$PATH python tests/test_batch_sched.py"""
@@ -187,21 +187,18 @@ if __name__ == '__main__':
     print(f'3 time share decode {s1:.2f} (want 0.5), VIP decode {s2:.2f} (0.8), VIP prefill {s3:.2f} (0.3); '
           f'chunk 2048 with decodes, 4096 alone')
 
-    # 4. VIP with all slots decoding: the newest low decode is parked (others keep a row every step), VIP runs, the
-    #    parked one resumes with no gap or duplicate; equal priority never preempts
+    # 4. VIP with all slots decoding: no decode is paused (every running stream keeps a row every step); VIP jumps
+    #    the queue and takes the first free slot ahead of an earlier same-priority waiter
     eng = FakeEngine(slots=3, step_s=0.02)
     res = run(eng, [(0, 'l1:1:30', 0), (0.01, 'l2:1:30', 0), (0.02, 'l3:1:30', 0), (0.3, 'same:1:3', 0),
                     (0.4, 'vip:2:3', 10)])
-    newest = max(('l1', 'l2', 'l3'), key=lambda n: res[n + ':req'].order)
-    assert [e[1] for e in eng.log if e[0] == 'parked'] == [newest], (newest, eng.log)
-    assert res['vip']['t'] < min(res[n]['t'] for n in ('l1', 'l2', 'l3', 'same')), order(res)
+    assert not eng.has('parked') and not eng.has('preempted'), eng.log
+    assert [e[1] for e in eng.log if e[0] == 'start'] == ['l1', 'l2', 'l3', 'vip', 'same'], eng.log
     for n in ('l1', 'l2', 'l3'):
         assert res[n]['text'] == full_text(n, 30), res[n]['text']
-    for n in {'l1', 'l2', 'l3'} - {newest}:
         idx = [i for i, s in enumerate(eng.steps) if n in s]
         assert idx == list(range(idx[0], idx[-1] + 1)), (n, 'paused')
-    assert [e[1] for e in eng.log if e[0] == 'start'].count(newest) == 2 and not eng.has('preempted')
-    print('4 VIP parked the newest of 3 running decodes; resumed stream continuous:', order(res))
+    print('4 VIP waited for a slot (no decode paused), then went ahead of the queue:', order(res))
 
     # 5. head-of-line: a big head blocked on pages; a later small request (same or lower priority) waits behind it
     eng = FakeEngine(slots=4, pages=100, step_s=0.02)

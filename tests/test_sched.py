@@ -45,13 +45,13 @@ def count(*e):
 
 
 # 1. gate/priority.py adapted to one slot: a blocker decoding, then spoof (prio 0) queued, then VIP (prio 10, sent the
-#    LiteLLM way as extra_body) 0.1 s later: the VIP parks the blocker's decode and runs; the blocker resumes (full,
-#    continuous output: ask() checks every token) before spoof (its place in line is kept).
+#    LiteLLM way as extra_body) 0.1 s later: the blocker's decode is never paused (full, continuous output: ask()
+#    checks every token); the VIP takes the slot next, ahead of spoof.
 order = scenario([(('blocker', 1, 20, 0), {}), (('spoof', 1, 2, 0.2), {'priority': 0}),
                   (('vip', 1, 2, 0.3), {'extra_body': {'priority': 10}})])
-assert order == ['vip', 'blocker', 'spoof'], order
-assert has('parked', 'blocker') and count('start', 'blocker') == 2
-print('1 VIP parked the decoding blocker, which resumed before spoof:', order)
+assert order == ['blocker', 'vip', 'spoof'], order
+assert not has('parked', 'blocker') and count('start', 'blocker') == 1
+print('1 blocker decode not paused; VIP went next, ahead of spoof:', order)
 
 # 2. VIP arrives while a low-priority request is in prefill: low is paused between chunks, VIP runs, low restarts.
 order = scenario([(('low', 40, 2, 0), {}), (('vip', 2, 2, 0.3), {'priority': 10})])
@@ -84,7 +84,7 @@ assert order == ['full1'] and count('start', 'full1') == 2, LOG
 print('5 NoRoom requeued')
 
 m = client.get('/metrics').text
-assert 'inkling_requests_total 15' in m and 'inkling_preemptions_total 3' in m and 'inkling_queue_depth 0' in m, m
+assert 'inkling_requests_total 15' in m and 'inkling_preemptions_total 2' in m and 'inkling_queue_depth 0' in m, m
 assert 'inkling_running 0' in m and 'inkling_batch_size 0' in m and 'inkling_slots 1' in m, m
 assert 'inkling_parked_bytes 123' in m and 'inkling_ooms_total 0' in m, m
 print('metrics ok:', ' '.join(l for l in m.splitlines() if not l.startswith('#'))[:200])

@@ -165,9 +165,9 @@ class Scheduler:
     (priority desc, arrival). Running: at most one prefill (chunked) plus the decodes, together <= eng.slots.
     Each iteration:
     - cancelled requests end (slot + pages freed, no park);
-    - admission: a waiting request preempts lower-priority work in its way: a lower-priority prefill always (one
-      prefill at a time), else, with no free slot or no pages, the lowest-priority newest running request (a prefill
-      parks between chunks, a decode parks at its position and later resumes without recompute). Then the head of the
+    - admission: a waiting request preempts a lower-priority prefill (one prefill at a time; it parks between chunks
+      and later resumes without recompute). Decodes are never preempted: once a reply streams it runs to the end, and
+      a higher-priority request only jumps the queue for the next free slot / pages. Then the head of the
       queue starts. If it gets NoRoom it blocks and nothing behind it starts until running requests free pages
       (protects a big request from a stream of small ones). NoRoom with nothing running gives up after INK_NOROOM_S;
     - one step: a prefill chunk (INK_CHUNK; INK_MIX_CHUNK while decodes run) or one batched decode step, by time
@@ -256,16 +256,12 @@ class Scheduler:
                     continue
                 return  # one prefill at a time
             if self.running() >= eng.slots:
-                if self._preempt_for(head):
-                    continue
                 return
             if time.time() < self.retry:
                 return
             e = self._start(head) if eng.can_start(head) else NoRoom('no free pages')
             if e is None:
                 return
-            if self._preempt_for(head):
-                continue
             head.noroom0 = getattr(head, 'noroom0', None) or time.time()
             if not self.running() and time.time() - head.noroom0 >= NOROOM_S:
                 pool = getattr(eng, 'pool', None)
@@ -318,26 +314,14 @@ class Scheduler:
         M['short_preemptions'] += 1
         return True
 
-    def _preempt_for(self, head):
-        """Preempt the lowest-priority, newest running request below head's priority; False if there is none."""
-        low = [r for r in self.active() if r.prio < head.prio]
-        if not low:
-            return False
-        self._preempt(min(low, key=lambda r: (r.prio, -r.order)))
-        return True
-
     def _preempt(self, r):
         global _cur
         _cur = r
         try:
             if r.cancel.is_set():  # the client is gone: free it, don't park anything for a rerun that won't come
                 return self._end(r, None)
-            if r is self.prefill:
-                self.prefill = None
-                self.eng.preempt_prefill(r)
-            else:
-                self.decoding.remove(r)
-                self.eng.preempt_decode(r)
+            self.prefill = None  # only the running prefill is ever preempted
+            self.eng.preempt_prefill(r)
         except Exception as e:
             return self._fail(r, e)
         finally:
