@@ -275,7 +275,7 @@ try:
                         out.append(v[1])
                     else:
                         res[name] = (kind, v, ''.join(out)); ev.set()
-                # spec label: low0 opts out (spec: false), low1 (parked by the VIP) and the VIP draft
+                # spec label: low0 opts out (spec: false), low1 and the VIP draft
                 req = eng.request(msgs, max_tokens=n, temperature=0, effort=0, emit=emit, prio=prio,
                                   spec=False if name == 'low0' else None)
                 sched.submit(req)
@@ -294,7 +294,8 @@ try:
                   flush=True)
             assert all(res[k][0] == 'done' for k in res) and got == solo, (res, solo)
             low1 = jobs[1][0]
-            assert server.M['preemptions'] == p0 + 1 and low1.P == len(low1.ids) > len(low1.prompt), \
+            # (76e2a0c: a VIP jumps the queue but no longer parks running decodes)
+            assert server.M['preemptions'] == p0 and len(low1.ids) == len(low1.prompt), \
                 (server.M['preemptions'], low1.P, len(low1.ids), len(low1.prompt))
             assert server.M['decode_rows'] > server.M['decode_steps'], 'never more than one row per step'
             forget_gpu(disk=False)
@@ -303,8 +304,8 @@ try:
             if label == 'spec':
                 assert bd.fw > server.M['decode_rows'] - rows0, 'no verify rows ran'
                 assert eng.ds is not None and eng.ds.live == 0 and len(eng.ds_free) <= 1, 'drafter States leaked'
-            print(f'PASS [{label}] 2 concurrent + VIP-preempted decode == solo (resumed at {low1.P} = prompt {len(low1.prompt)} + '
-                  f'{low1.P - len(low1.prompt)} fed, no recompute), no page leak; moves (from the Decoder?) {moves}')
+            print(f'PASS [{label}] 2 concurrent + a VIP (queued, decodes not parked) == solo, no page leak; '
+                  f'moves (from the Decoder?) {moves}')
         eng.spec = 'off'
 
         # spec through generate: greedy == plain (max_tokens, stop string), DSpark and prompt lookup; then prefix
