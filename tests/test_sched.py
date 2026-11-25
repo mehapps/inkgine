@@ -1,4 +1,4 @@
-"""CPU, no model: priority queue + preemption through the real HTTP handlers with a fake step engine (one slot;
+"""CPU, no model: priority queue + short-first preemption through the real HTTP handlers with a fake step engine (one slot;
 batching itself: test_batch_sched.py).
 Run: cd engine && PATH=$PWD/.venv/bin:$PATH python tests/test_sched.py"""
 import os
@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 import server
 from test_batch_sched import FakeEngine
 
-server.eng = FakeEngine(slots=1)  # one slot: the old one-at-a-time scenarios, now with decode preemption
+server.eng = FakeEngine(slots=1)  # one slot: the old one-at-a-time scenarios, decodes and prefills never paused by priority
 server.sched = server.Scheduler(server.eng)
 LOG = server.eng.log
 client = TestClient(server.app)
@@ -53,12 +53,11 @@ assert order == ['blocker', 'vip', 'spoof'], order
 assert not has('parked', 'blocker') and count('start', 'blocker') == 1
 print('1 blocker decode not paused; VIP went next, ahead of spoof:', order)
 
-# 2. VIP arrives while a low-priority request is in prefill: low is paused between chunks, VIP runs, low restarts.
-order = scenario([(('low', 40, 2, 0), {}), (('vip', 2, 2, 0.3), {'priority': 10})])
-assert order == ['vip', 'low'] and has('preempted', 'low'), (order, LOG)
-assert [e[:2] for e in LOG].index(('preempted', 'low')) < [e[:2] for e in LOG].index(('start', 'vip'))
-assert count('start', 'low') == 2
-print('2 prefill preempted:', [e[:2] for e in LOG if e[0] != 'chunk'])
+# 2. VIP arrives while a low-priority request is in prefill, after a normal waiter: low is not paused (priority only
+#    jumps the queue), the VIP goes next, ahead of the earlier waiter (5 chunks = 20480 > SHORT_MAX: no short-first)
+order = scenario([(('low', 40, 2, 0), {}), (('n', 5, 2, 0.1), {}), (('vip', 2, 2, 0.3), {'priority': 10})])
+assert order == ['low', 'vip', 'n'] and not has('preempted') and count('start', 'low') == 1, (order, LOG)
+print('2 running prefill not paused by the VIP; VIP went next, ahead of n:', order)
 
 # 3. FIFO within a level, higher level first: queued behind a blocker that nobody may preempt (priority 9)
 order = scenario([(('blocker', 1, 40, 0), {'priority': 9}), (('a', 1, 1, 0.1), {'priority': 0}),
@@ -84,7 +83,7 @@ assert order == ['full1'] and count('start', 'full1') == 2, LOG
 print('5 NoRoom requeued')
 
 m = client.get('/metrics').text
-assert 'inkling_requests_total 15' in m and 'inkling_preemptions_total 2' in m and 'inkling_queue_depth 0' in m, m
+assert 'inkling_requests_total 16' in m and 'inkling_preemptions_total 1' in m and 'inkling_queue_depth 0' in m, m
 assert 'inkling_running 0' in m and 'inkling_batch_size 0' in m and 'inkling_slots 1' in m, m
 assert 'inkling_parked_bytes 123' in m and 'inkling_ooms_total 0' in m, m
 print('metrics ok:', ' '.join(l for l in m.splitlines() if not l.startswith('#'))[:200])

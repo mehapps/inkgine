@@ -462,7 +462,8 @@ if __name__ == '__main__':
     ev = [e[1] if e[0] == 'chunk' else 'P' for e in eng.log if e[:2] in (('chunk', 'cold'), ('preempted', 'cold'))]
     assert ev.count('P') == 3 and 'P' not in ''.join(x[0] for x in ev).replace('cP', ''), ev  # a cold chunk before each P
     assert all(res[n]['t'] < res['cold']['t'] for n in ('w1', 'w2', 'w3'))
-    for specs in ([(0, 'cold:20:1', 5), (0.15, 'warm:1:1', 0)],   # lower priority: waits (VIP rules unchanged)
+    for specs in ([(0, 'cold:20:1', 5), (0.15, 'warm:1:1', 0)],   # lower priority: waits
+                  [(0, 'cold:20:1', 0), (0.15, 'vip:1:1', 10)],   # higher priority: queued first, never pauses it
                   [(0, 'cold:20:1', 0), (0.15, 'mid:5:1', 0)]):   # 5 chunks = 20480 > SHORT_MAX: FIFO
         eng = FakeEngine(slots=4, chunk_s=0.02, step_s=0.01)
         res = run(eng, specs)

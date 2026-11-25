@@ -133,6 +133,8 @@ loop:
          prefix tree, keep=True so pages + state go to disk if the pool needs the pages; the Request (parser,
          RNG, grammar) goes back to the heap and resumes through restore with no recompute.
 ```
+- As built (2026-11-24): priority never preempts. A VIP only jumps to the front of the queue; running prefills and
+  decodes finish. Prefill parking is used by short-first only (a short same-priority turn pauses a long prefill).
 - Cancel (client gone): checked every iteration; frees slot and pages, no park.
 - NoRoom handling stays (requeue; error after INK_NOROOM_S), but with batching NoRoom means "wait for a running
   request to finish", and the head-of-line rule decides who gets the freed pages.

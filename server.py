@@ -167,11 +167,11 @@ class Scheduler:
     (priority desc, arrival). Running: at most one prefill (chunked) plus the decodes, together <= eng.slots.
     Each iteration:
     - cancelled requests end (slot + pages freed, no park);
-    - admission: a waiting request preempts a lower-priority prefill (one prefill at a time; it parks between chunks
-      and later resumes without recompute). Decodes are never preempted: once a reply streams it runs to the end, and
-      a higher-priority request only jumps the queue for the next free slot / pages. Then the head of the
-      queue starts. If it gets NoRoom it blocks and nothing behind it starts until running requests free pages
-      (protects a big request from a stream of small ones). NoRoom with nothing running gives up after INK_NOROOM_S;
+    - admission: one prefill at a time. Priority never pauses running work: a running prefill or decode runs to the
+      end, and a higher-priority request only jumps to the front of the queue (next prefill, next free slot / pages).
+      The one exception is short-first (below), within a level. Then the head of the queue starts. If it gets
+      NoRoom it blocks and nothing behind it starts until running requests free pages (protects a big request from
+      a stream of small ones). NoRoom with nothing running gives up after INK_NOROOM_S;
     - one step: a prefill chunk (INK_CHUNK; INK_MIX_CHUNK while decodes run) or one batched decode step, by time
       share: decodes get INK_DECODE_SHARE of the wall time (0.8 when they outrank the prefill, 0.3 when it outranks
       them), tracked as measured time (whoever is behind runs next).
@@ -249,9 +249,6 @@ class Scheduler:
                 q = [jump] + [x for x in q if x is not jump]
             head, pf, jump = q[0], self.prefill, None
             if pf is not None:
-                if head.prio > pf.prio:
-                    self._preempt(pf)
-                    continue
                 if self._short_first(head, pf):
                     self._preempt(pf)
                     jump = head

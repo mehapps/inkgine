@@ -1,4 +1,4 @@
-"""GPU window: json_schema, VIP priority + preemption, prefix reuse (also with a 16.7 MP image: imgcache), stop sequences,
+"""GPU window: json_schema, VIP priority (queue jump, no preemption), prefix reuse (also with a 16.7 MP image: imgcache), stop sequences,
 concurrency (continuous batching), speculative decoding (spec: DSpark on vs `spec: false`), against our running server (default :30000).
 Usage: python tests/gpu_features.py [json|priority|prefix|imgcache|stop|concurrency|spec|logprobs|n|tools|params|specproc|all|ckpt] [BASE]
 (ckpt: not part of all; start the server with INK_CKPT_EVERY=32768)  exit 0 = all checks passed
@@ -89,8 +89,8 @@ def run_all(specs):
 
 def t_priority():
     print('== priority (gate/priority.py adapted): every decode slot busy with a blocker, spoof (priority 0, as the '
-          'LiteLLM hook rewrites non-VIPs) queued, VIP (10) 1 s later: the VIP parks the newest blocker\'s decode and '
-          'finishes first; the parked blocker resumes and completes all its tokens', flush=True)
+          'LiteLLM hook rewrites non-VIPs) queued, VIP (10) 1 s later: no blocker is paused; the VIP takes the first free '
+          'slot ahead of spoof; every blocker completes all its tokens', flush=True)
     slots, n = int(metric('slots') or 1), 600
     # greedy + a list far longer than max_tokens: a blocker can't finish early (a stray EOS -> inconclusive, reported)
     long_list = 'Write the numbers from 1 to 3000 separated by commas, nothing else. ({})'
@@ -124,27 +124,23 @@ def t_priority():
     check(full and not early, f'conclusive: all {slots} slots decoding blockers when spoof + VIP arrived, and no blocker '
           f'stopped before {n} tokens (else INCONCLUSIVE, not a scheduler verdict): {toks}')
     ok = full and all(done.get(k) for k in ['vip', 'spoof'] + [f'blocker{i}' for i in range(slots)])
-    check(ok and done['vip'] < done['spoof'] and done['vip'] < min(done[f'blocker{i}'] for i in range(slots)),
-          'VIP finished first (parked a blocker), before spoof and every blocker')
-    check((metric('preemptions') or 0) > p0, 'a decode was preempted (preemptions metric went up)')
-    check(all(t == n for t in toks), f'every blocker completed all {n} tokens, incl. the parked one: {toks}')
+    check(ok and done['vip'] < done['spoof'], 'VIP jumped the queue: finished before spoof')
+    check((metric('preemptions') or 0) == p0, 'no decode was preempted (preemptions metric unchanged)')
+    check(all(t == n for t in toks), f'every blocker completed all {n} tokens: {toks}')
     # idle trim: after N concurrent requests the server keeps one warm slot Decoder (~0.2 GB) + parked states
     idle1, dec1, pb = (metric(k) or 0 for k in ('vram_allocated_bytes', 'slot_decoders', 'parked_bytes'))
     # (BatchDecoder: slot_decoders == slots, one shared set of buffers that stays allocated)
     check((dec1 <= 1 or metric('batch_decoder')) and idle1 - pb <= idle0 + 0.5 * 2**30,
           f'idle allocation after {slots} concurrent: {idle1 / 2**30:.2f} GiB (parked {pb / 2**30:.2f}) vs before '
           f'{idle0 / 2**30:.2f} GiB (minus parked), slot decoders {dec1:.0f}')
-    print('== preemption: VIP arrives while a ~90k-token low-priority prompt is prefilling', flush=True)
+    print('== no priority preemption: VIP arrives while a ~90k-token low-priority prompt is prefilling', flush=True)
     # ~90k tokens and the VIP at 2 s: prefill got fast enough (11-23 glue) that a 36k prompt finished before a 4 s VIP
     doc, _ = gate.filler('prio' + str(int(time.time())), 150000, needles=1)
     p0 = metric('preemptions')
     done = run_all([(0, ('low', 8), {'content': doc + '\n\nSummarize in one line. ({})', 'priority': 0}),
                     (2, ('vip2', 8), {'priority': 10})])
-    check(done.get('vip2') and done.get('low') and done['vip2'] < done['low'], 'VIP finished before the preempted prefill')
-    check((metric('preemptions') or 0) > (p0 or 0), f"preemptions metric went up ({p0} -> {metric('preemptions')})")
-    u = done.get('low:usage') or {}
-    cached = u.get('prompt_tokens_details', {}).get('cached_tokens', 0)
-    check(cached >= 4096, f"preempted prompt resumed from its parked progress, no restart (cached {cached}/{u.get('prompt_tokens')})")
+    check(done.get('vip2') and done.get('low'), 'both finished')
+    check((metric('preemptions') or 0) == (p0 or 0), f"prefill not paused by the VIP (preemptions {p0} -> {metric('preemptions')})")
 
 
 def t_prefix():

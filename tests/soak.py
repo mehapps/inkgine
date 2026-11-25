@@ -31,7 +31,7 @@ THRESHOLDS = {
     'check_failures': 0,            # bad json_schema JSON, forced tool call missing, stream without [DONE]/usage, n/logprobs shape
     'ooms': 0,                      # /metrics inkling_ooms_total delta over the run
     'server_restarts': 0,           # /metrics inkling_requests_total went backwards, or /health failed at the end
-    'ttft_light_vip_p95_s': 5.0,    # TTFT of VIP requests with < 4096 uncached prompt tokens (VIP preempts prefill)
+    'ttft_light_vip_p95_s': 5.0,    # TTFT of VIP requests with < 4096 uncached prompt tokens (VIP jumps the queue)
     'ttft_light_p50_s': 3.0,        # TTFT of all light requests (queueing behind big prefills is allowed in the tail)
     'decode_tps_p50': 30.0,         # per-stream completion tok/s after the first token (requests with >= 32 tokens)
     'followup_cache_hit_min': 0.6,  # sum(cached_tokens) / sum(prompt_tokens) over turns 2+ of sessions

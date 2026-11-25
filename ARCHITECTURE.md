@@ -7,7 +7,7 @@ Update it when a decision changes. Inkling 2 Mini only, one RTX 5090 (32 GB), on
 Replaces Qwen behind LiteLLM as the live model, with:
 - 1M-token context: one 1M request runs alone; otherwise several smaller requests share the same memory pool.
 - Text + full-resolution images, tools, reasoning effort, json_schema, streaming, OpenAI API.
-- VIP priority (LiteLLM's `priority` field; VIPs jump the queue and can pause lower-priority work).
+- VIP priority (LiteLLM's `priority` field; VIPs jump to the front of the queue; running work is never paused for them).
 - Prefix cache with a disk tier (multi-turn chats don't re-read their history).
 - Fast enough that switching isn't a downgrade (targets below), and it passes the SGLang change gate in memory.
 
