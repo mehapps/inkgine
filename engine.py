@@ -701,8 +701,16 @@ class Engine:
                 rows += rw
             lg = self.bd.step(rows, tok=tok) if tok else self.bd.step(rows)
             plain = [(r, r0) for r, (r0, ctx) in zip(reqs, ctxs) if ctx is None]
-            for r, (r0, ctx) in zip(reqs, ctxs):
+            for r, (r0, ctx) in zip(reqs, ctxs):  # every request's json masks before the first settle syncs
                 if ctx is not None:
+                    try:
+                        r.sp.host(ctx)
+                    except torch.OutOfMemoryError:
+                        raise
+                    except Exception as e:
+                        self._fail_one(r, e)
+            for r, (r0, ctx) in zip(reqs, ctxs):
+                if ctx is not None and not r.done:
                     try:
                         self._settle(r, lg, r0, ctx)
                     except torch.OutOfMemoryError:

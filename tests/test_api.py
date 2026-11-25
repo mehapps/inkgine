@@ -335,6 +335,7 @@ sp = spec_runner.Spec(None, None, 0, lookup=Lookup([]), cons=tc)
 call = enc('get_time') + [chat.INVOKE_JSON] + enc('{"name":"get_time","args":{}}') + [chat.END]
 d = [chat.MODEL] + call[:5]
 kept, bad, masks = sp._grammar(d)
+masks = sp.host([kept, None, masks, bad])[2]  # (json rows: built after the launch)
 assert kept == d and bad is None and tc.state == 'start' and not tc.done
 assert all(torch.isfinite(masks[i, t]) for i, t in enumerate(d))
 kept, bad, _ = sp._grammar([chat.MODEL, chat.TEXT])

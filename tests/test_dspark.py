@@ -698,8 +698,9 @@ def test_spec_sampled_bad():
             x[bad] = float('-inf')
             return x
 
-        def accept(self, t):
-            assert t not in bad
+        def accept(self, t, check=False):
+            assert check or t not in bad
+            return t not in bad
 
     hist = list(range(P))
     bd0 = FakeBD(Vf, P, hist)

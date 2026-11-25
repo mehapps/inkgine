@@ -62,16 +62,21 @@ def mask_rows(lg, cons):
             c.mask(lg[i])
     if js:
         dev = lg.device
-        sh = _SHIFTS.get(dev)
-        if sh is None:
-            sh = _SHIFTS[dev] = torch.arange(32, dtype=torch.int32, device=dev)
-        bits = torch.cat([cons[i].bits for i in js]).to(dev)
-        ok = ((bits[:, :, None] >> sh) & 1).bool().view(len(js), -1)[:, :VOCAB]
+        ok = unpack(torch.cat([cons[i].bits for i in js]), dev)
         if len(js) == lg.shape[0]:
             lg.masked_fill_(~ok, float('-inf'))
         else:
             g = torch.tensor(js, device=dev)
             lg[g] = lg.index_select(0, g).masked_fill_(~ok, float('-inf'))
+
+
+def unpack(bits, dev, non_blocking=False):
+    """Host bitmask [R, words] int32 -> allowed [R, VOCAB] bool on dev (one copy; non_blocking needs pinned bits)."""
+    sh = _SHIFTS.get(dev)
+    if sh is None:
+        sh = _SHIFTS[dev] = torch.arange(32, dtype=torch.int32, device=dev)
+    bits = bits.to(dev, non_blocking=non_blocking)
+    return ((bits[:, :, None] >> sh) & 1).bool().view(len(bits), -1)[:, :VOCAB]
 
 
 class Tools:
@@ -176,14 +181,37 @@ class ToolCall:
             self._keep(logits, self.t.next[s[1]])
         return logits
 
-    def accept(self, t):
+    def allows(self, t):
+        """Whether mask() leaves token t finite, outside 'json' (host only, no [VOCAB] row)."""
+        s, nx = self.state, self.t.next
+        if s == 'free':
+            return t != chat.INVOKE_JSON
+        if s == 'lhead':
+            return t != chat.INVOKE_JSON and (t in nx[()] or chat.USER <= t < VOCAB)
+        if s[0] == 'think':
+            return t == chat.END if self.think_max is not None and s[1] >= self.think_max else t != chat.EOS
+        if s in ('start', 'start1'):
+            return t == chat.MODEL
+        if s in ('header', 'header1'):
+            return t in nx[()] or (t == chat.THINK and self.t.think and s == 'header')
+        return t in nx[s[1]]
+
+    def accept(self, t, check=False):
+        """Advance by token t. check: a token mask() bans is refused (-> False, nothing changes) instead of
+        raising (json) or being taken unchecked (the other states)."""
         s = self.state
         if s == 'json':
-            if not self.m.accept_token(t):
+            # (specials but END are never in the bitmask; accept_token would reject them too, logging a warning each)
+            if check and t >= chat.USER and t != chat.END or not self.m.accept_token(t):
+                if check:
+                    return False
                 raise RuntimeError(f'grammar rejected token {t}')
             if self.m.is_terminated():
                 self.state, self.done = 'free', not self.t.parallel
-        elif s == 'free':
+            return True
+        if check and not self.allows(t):
+            return False
+        if s == 'free':
             if t == chat.MODEL:
                 self.state = 'lhead'
         elif s == 'lhead':
@@ -199,6 +227,7 @@ class ToolCall:
                 self.m, self.state = xgr.GrammarMatcher(self.t.compiled[self.t.names[s[1]]]), 'json'
             else:
                 self.state = ('name', s[1] + (t,))
+        return True
 
 
 class Json:
@@ -221,15 +250,29 @@ class Json:
             logits[keep] = v
         return logits
 
-    def accept(self, t):
+    def allows(self, t):
+        """Whether mask() leaves token t finite, outside 'json' (host only)."""
+        if self.state == 'think':
+            return t != chat.EOS
+        return t == chat.MODEL if self.state == 'start' else t in (chat.THINK, chat.TEXT)
+
+    def accept(self, t, check=False):
+        """As ToolCall.accept."""
         s = self.state
         if s == 'json':
-            if not self.m.accept_token(t):
+            # (specials but END are never in the bitmask; accept_token would reject them too, logging a warning each)
+            if check and t >= chat.USER and t != chat.END or not self.m.accept_token(t):
+                if check:
+                    return False
                 raise RuntimeError(f'grammar rejected token {t}')
             self.done = self.m.is_terminated()
-        elif s == 'start':
+            return True
+        if check and not self.allows(t):
+            return False
+        if s == 'start':
             self.state = 'header'
         elif s == 'header':
             self.state = 'json' if t == chat.TEXT else 'think'
         elif t == chat.END:
             self.state = 'start'
+        return True

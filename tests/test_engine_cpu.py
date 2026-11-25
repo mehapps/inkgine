@@ -6,7 +6,7 @@ forwards; drafts forced): greedy DSpark / lookup spec == plain incl. max_tokens 
 (drafter starts at P) == cold plain, the scheduler case with a spec: false slot next to spec slots and the VIP parking
 a spec decode (resumes with a fresh drafter) == solo, greedy spec with logit processors == plain; then (--json) a greedy json_schema generation (+ with spec).
 Mid-prompt checkpoints (INK_CKPT_EVERY): an edited prompt restored from a checkpoint == cold.
-Run: cd engine && PATH=$PWD/.venv/bin:$PATH python tests/test_engine_cpu.py [--json] [--rest: skip the prefix + checkpoint cases] [--ckpt: only the checkpoint case]"""
+Run: cd engine && PATH=$PWD/.venv/bin:$PATH python tests/test_engine_cpu.py [--json] [--rest: skip the prefix + checkpoint cases] [--ckpt: only the checkpoint case] [--json-only]"""
 import json
 import os
 import shutil
@@ -126,9 +126,36 @@ def ckpt_case():
         engine.CKPT, eng.chunk = ck0, chunk0
 
 
+def json_case():
+    schema = {'type': 'object', 'properties': {'city': {'type': 'string'}, 'population_millions': {'type': 'number'}},
+              'required': ['city', 'population_millions'], 'additionalProperties': False}
+    rf = grammar.compile_format(eng.tok, {'type': 'json_schema', 'json_schema': {'name': 'c', 'schema': schema}})
+    t0, st = time.time(), {}
+    out = ''.join(d[1] for d in eng.generate(
+        [{'role': 'user', 'content': 'Give the capital of France and its rough metro population in millions.'}],
+        max_tokens=40, temperature=0, effort=0, prefill_text=True, response_format=rf, stats=st))
+    print(f'json_schema output ({time.time() - t0:.0f} s, {st["completion_tokens"]} tokens, {st["finish_reason"]}): {out!r}')
+    d = json.loads(out)
+    assert d['city'].lower() == 'paris' and isinstance(d['population_millions'], (int, float))
+    print('PASS json_schema real weights')
+    eng.bd, eng.spec, st2 = SeqBatch(m, 2), 'dspark', {}  # json + spec: drafts cut at the first rejected token
+    out2 = ''.join(d[1] for d in eng.generate(
+        [{'role': 'user', 'content': 'Give the capital of France and its rough metro population in millions.'}],
+        max_tokens=40, temperature=0, effort=0, prefill_text=True, response_format=rf, stats=st2))
+    assert out2 == out, (out2, out)
+    print(f'PASS json_schema with spec == without ({eng.bd.fw} forwards)')
+
+
 try:
     if '--ckpt' in sys.argv:  # only the checkpoint case
         ckpt_case()
+        print('ALL OK')
+        raise SystemExit(0)
+    if '--json-only' in sys.argv:  # only the json case, drafting every round up to k = 7 as in the full run
+        spec_runner.step_ms = lambda sampled=False: (1.0,) * 8
+        spec_runner.VERIFY_MS = (1.0,) * 8
+        eng.bd = LoopBatch(m, 2)
+        json_case()
         print('ALL OK')
         raise SystemExit(0)
     if '--rest' not in sys.argv:
@@ -370,23 +397,7 @@ try:
         print('PASS image hash in prefix key')
 
     if '--json' in sys.argv:
-        schema = {'type': 'object', 'properties': {'city': {'type': 'string'}, 'population_millions': {'type': 'number'}},
-                  'required': ['city', 'population_millions'], 'additionalProperties': False}
-        rf = grammar.compile_format(eng.tok, {'type': 'json_schema', 'json_schema': {'name': 'c', 'schema': schema}})
-        t0, st = time.time(), {}
-        out = ''.join(d[1] for d in eng.generate(
-            [{'role': 'user', 'content': 'Give the capital of France and its rough metro population in millions.'}],
-            max_tokens=40, temperature=0, effort=0, prefill_text=True, response_format=rf, stats=st))
-        print(f'json_schema output ({time.time() - t0:.0f} s, {st["completion_tokens"]} tokens, {st["finish_reason"]}): {out!r}')
-        d = json.loads(out)
-        assert d['city'].lower() == 'paris' and isinstance(d['population_millions'], (int, float))
-        print('PASS json_schema real weights')
-        eng.bd, eng.spec, st2 = SeqBatch(m, 2), 'dspark', {}  # json + spec: drafts cut at the first rejected token
-        out2 = ''.join(d[1] for d in eng.generate(
-            [{'role': 'user', 'content': 'Give the capital of France and its rough metro population in millions.'}],
-            max_tokens=40, temperature=0, effort=0, prefill_text=True, response_format=rf, stats=st2))
-        assert out2 == out, (out2, out)
-        print(f'PASS json_schema with spec == without ({eng.bd.fw} forwards)')
+        json_case()
     print('ALL OK')
 finally:
     shutil.rmtree(CACHE, ignore_errors=True)

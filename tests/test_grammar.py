@@ -193,6 +193,7 @@ assert kept == txt[:1] and bad == chat.INVOKE_JSON and c.state == 'free'
 call = [chat.MODEL] + enc('Read') + [chat.INVOKE_JSON] + enc('{"name":"Read","args":{"file_path":"/a"}}') + [chat.END]
 d = txt + call[:6]
 kept, bad, masks = sp._grammar(d)
+masks = sp.host([kept, None, masks, bad])[2]  # (json rows: built after the launch)
 assert kept == d and bad is None and c.state == 'free' and c.m is None and all(torch.isfinite(masks[i, t])
                                                                               for i, t in enumerate(d))
 kept, bad, _ = sp._grammar(txt + [chat.MODEL, chat.INVOKE_JSON])
@@ -212,6 +213,67 @@ feed(c, two + call[8:])  # m0 rolled back correctly: the same tokens are accepte
 assert c.state == 'free' and not c.done
 print('tool_choice auto + spec drafts: outside calls only INVOKE_JSON masked (fixed mask), masks + rollback across '
       'the call start and into a second call, device draft ids cut in host()')
+
+
+# draft cut + verify-row masks (cut before the launch, json masks in host() after it) == an independent construction:
+# a constraint rebuilt from the history, cons.mask on a fresh row per step, cut at the first -inf / after done
+
+
+def ref_masks(mk, hist, d):
+    c = mk()
+    for t in hist:
+        c.accept(t)
+    kept, bad, rows = [], None, []
+    for t in d:
+        rows.append(c.mask(torch.zeros(grammar.VOCAB)))
+        if not torch.isfinite(rows[-1][t]):
+            bad = t
+            rows.pop()
+            break
+        c.accept(t)
+        kept.append(t)
+        if c.done:
+            break
+    if not c.done:
+        rows.append(c.mask(torch.zeros(grammar.VOCAB)))
+    return kept, bad, rows
+
+
+SPECIAL = [chat.MODEL, chat.END, chat.INVOKE_JSON, chat.THINK, chat.TEXT, chat.EOS]
+JS = {'type': 'json_schema', 'json_schema': {'schema': SCHEMA}}
+cases = [(lambda par=par: grammar.ToolCall(grammar.compile_tools(tok, AUTO, 'auto', True, par)), auto_run(par, 10 + par)[2])
+         for par in (True, False)]
+cases.append((lambda: grammar.ToolCall(grammar.compile_tools(tok, AUTO, 'required', True), think_max=4),
+              [chat.MODEL, chat.THINK, 11, 12, chat.END] + call))
+cases.append((lambda: grammar.Json(grammar.compile_format(tok, JS), False), run(JS, False, 7, think_then)[1]))
+g, nr, seen = torch.Generator().manual_seed(3), 0, set()
+for mk, path in cases:
+    c = mk()
+    sp = spec_runner.Spec(None, None, 0, lookup=Lookup([]), cons=c)
+    for p0 in range(len(path)):
+        for _ in range(2):
+            d = path[p0:p0 + int(torch.randint(1, 16, (1,), generator=g))]
+            if torch.rand(1, generator=g) < 0.6:  # a wrong token somewhere: random, special or out of the path
+                i = int(torch.randint(len(d), (1,), generator=g))
+                x = torch.randint(3, (1,), generator=g).item()
+                d = d[:i] + [int(torch.randint(chat.USER, (1,), generator=g)) if x == 0 else
+                             SPECIAL[int(torch.randint(len(SPECIAL), (1,), generator=g))] if x == 1 else
+                             path[int(torch.randint(len(path), (1,), generator=g))]] + d[i + 1:]
+            want = ref_masks(mk, path[:p0], d)
+            st = c.state
+            kept, bad, masks = sp._grammar(d)
+            assert c.state == st, (c.state, st)
+            masks = sp.host([kept, None, masks, bad])[2]
+            assert (kept, bad) == want[:2], (p0, d, kept, bad, want[:2])
+            assert len(want[2]) in (len(kept), len(kept) + 1)
+            assert all(torch.equal(masks[i], r) for i, r in enumerate(want[2])), (p0, d)
+            seen.add((type(st).__name__ if isinstance(st, tuple) else st, bad is not None, c.done or
+                      len(want[2]) == len(kept)))
+            nr += 1
+        c.accept(path[p0])
+    assert c.done or path[-1] in (chat.EOS, chat.END)
+print(f'spec draft cut + masks == independent per-row masks: {nr} drafts over {len(cases)} paths '
+      f'(tool auto parallel / single, forced + think budget, json + thinking), {len(seen)} (state, rejected, done) kinds')
 # a named tool_choice ends the reply after its call, even with parallel calls on (no forced copies of it)
 n = grammar.ToolCall(grammar.compile_tools(tok, AUTO, {'type': 'function', 'function': {'name': 'Read'}}, False, True))
 feed(n, call)

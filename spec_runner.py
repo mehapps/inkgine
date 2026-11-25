@@ -38,6 +38,7 @@ import torch
 
 import chat
 from dspark import BLOCK
+import grammar
 from grammar import ToolCall
 from loopbatch import LoopBatch
 from model import VOCAB
@@ -60,6 +61,8 @@ SAMPLED_MS = 0.36
 FAR_MS = 6.9e-6
 GATE = os.environ.get('INK_SPEC_GATE') == '1'
 ACCEPT_DEV = os.environ.get('INK_SPEC_ACCEPT_DEV') == '1'
+# ctx[2] of a round whose json verify-row masks are not built yet: host() builds them after the verify launch
+PEND = object()
 # DSpark + Width: after SLEEP consecutive rounds where drafting doesn't pay (probes included), the request goes dormant:
 # plain rows only, no drafter work at all (no catch-up passes, no probes); WAKE positions later the drafter context
 # restarts at the current position and the controller probes again. 0 = never sleep.
@@ -138,6 +141,7 @@ class Spec:
         self.offrun, self.sleep_at = 0, None              # rounds in a row not worth drafting; dormant since pos
         self.dev_tok = getattr(bd, 'dev_tok', False) and ds is not None and self.gate is None
         self.gm = self.gfree = None                       # grammar masks of the verify rows [8, V] (lazy)
+        self.gbits = None                                 # their json rows' xgrammar bitmasks (host, pinned on cuda)
         self.stats = dict(rounds=0, drafted=0, accepted=0, emitted=0,    # (rounds/emitted: drafting rounds only)
                           draft_s=0.0, step_s=0.0, settle_s=0.0,   # settle: waits for the verify + accepts
                           tried=[0] * RMAX, kept=[0] * RMAX,   # per draft position: drafted / accepted
@@ -263,7 +267,7 @@ class Spec:
         if self.cons is not None:
             d, bad, masks = self._grammar(d)
         rows = [(self.slot, pos + i, t) for i, t in enumerate([last] + d)]
-        return rows, (d, q, masks, bad)
+        return rows, [d, q, masks, bad]
 
     def _noise(self, pos):
         """Exp(1) [V] of the token at position pos (cached for this round: the drafter and settle share it)."""
@@ -325,7 +329,7 @@ class Spec:
             d, bad, masks = self._grammar(d)
         if not d and bad is None:
             return [(self.slot, pos, last)], None
-        return [(self.slot, pos + i, t) for i, t in enumerate([last] + d)], (d, None, masks, bad)
+        return [(self.slot, pos + i, t) for i, t in enumerate([last] + d)], [d, None, masks, bad]
 
     def _extend(self, d, q, left, kcap):
         """Hybrid: DSpark drafted d (all k it was asked for, no stop id); if a copy continues after d and pays (the
@@ -425,19 +429,23 @@ class Spec:
         return out
 
     def host(self, ctx):
-        """Device draft ids (dev_tok) in ctx -> host ids, read now (after the verify launch), cut + masked by the
-        constraint, which sees them only now (the verify rows after a cut are just unused). -> ctx (in place)."""
+        """After the verify launch (idempotent): device draft ids (dev_tok) in ctx -> host ids, cut + masked by the
+        constraint, which sees them only now (the verify rows after a cut are just unused); pending json masks
+        (PEND) built, overlapping the verify. -> ctx (in place)."""
         if torch.is_tensor(ctx[0]):
             ctx[0] = ctx[0].tolist()
             if self.cons is not None:
                 ctx[0], ctx[3], ctx[2] = self._grammar(ctx[0])
+        if ctx[2] is PEND:
+            ctx[2] = self._fill(ctx[0])
         return ctx
 
     def _grammar(self, d):
-        """Cut the draft at the first token the json constraint rejects (or after the one that finishes it) and
-        build the additive masks (0 / -inf) of the T = len(kept) + 1 verify rows along the draft path -> (kept,
-        rejected token or None, masks). The constraint is rolled back afterwards (settle() advances it by the emitted
-        tokens)."""
+        """Cut the draft at the first token the constraint rejects (or after the one that finishes it) -> (kept,
+        rejected token or None, masks): the additive masks (0 / -inf) of the T = len(kept) + 1 verify rows along the
+        draft path. Before the launch only the cut (matcher accept_token, allows()) and the non-json rows (rare: call
+        headers); json rows (xgrammar bitmask, ~0.25 ms each) make masks PEND: host() fills them after the launch
+        (_fill). The constraint is rolled back (settle() advances it by the emitted tokens)."""
         cons = self.cons
         if cons.state == 'free' and isinstance(cons, ToolCall) and chat.MODEL not in d and chat.INVOKE_JSON not in d:
             if self.gfree is None:                        # tool_choice auto outside a call: one fixed mask (every row
@@ -446,26 +454,59 @@ class Spec:
             return d, None, self.gfree
         if self.gm is None:
             self.gm = torch.zeros(RMAX + 1, self.V, device=self.dev)
-        g = self.gm
+            self.gbits = grammar.xgr.allocate_token_bitmask(RMAX + 1, grammar.VOCAB)
+            if self.dev.type == 'cuda':                   # (async copy in _fill)
+                self.gbits = self.gbits.pin_memory()
+        g, js = self.gm, []
+        g[:len(d) + 1].zero_()
+        kept, bad = self._walk(d, lambda i: js.append(i) if cons.state == 'json' else cons.mask(g[i]))
+        return kept, bad, PEND if js else g
+
+    def _walk(self, d, row):
+        """Advance the constraint along d, calling row(i) at verify row i's state (rows 0..len(kept); the bonus row
+        unless the constraint finished), up to the first rejected token / after the finishing one -> (kept, bad).
+        Rolled back afterwards: state + done + m, m.rollback(json tokens accepted on the original matcher)."""
+        cons = self.cons
         state, done, m0, nj, kept, bad = cons.state, cons.done, getattr(cons, 'm', None), 0, [], None
-        for i, t in enumerate(d):
-            g[i].zero_()
-            cons.mask(g[i])
-            if not torch.isfinite(g[i, t]):
-                bad = t
-                break
-            nj += cons.state == 'json' and cons.m is m0   # (a later call in the draft gets its own matcher)
-            cons.accept(t)
-            kept.append(t)
-            if cons.done:
-                break
-        g[len(kept)].zero_()
-        if not cons.done:                                 # (after a finishing token the bonus row is dropped anyway)
-            cons.mask(g[len(kept)])
-        if nj:
-            m0.rollback(nj)
-        cons.state, cons.done, cons.m = state, done, m0
-        return kept, bad, g
+        try:
+            for t in d:
+                row(len(kept))
+                j = cons.state == 'json' and cons.m is m0   # (a later call in the draft gets its own matcher)
+                if not cons.accept(t, check=True):
+                    bad = t
+                    break
+                nj += j
+                kept.append(t)
+                if cons.done:
+                    break
+            if bad is None and not cons.done:             # (after a finishing token the bonus row is dropped anyway)
+                row(len(kept))
+        finally:
+            if nj:
+                m0.rollback(nj)
+            cons.state, cons.done, cons.m = state, done, m0
+        return kept, bad
+
+    def _fill(self, kept):
+        """The json rows of a PEND round's masks: replay the kept draft from the (rolled back) constraint, bitmasks
+        into the host buffer, one copy (async on cuda: the verify is still running), unpack, -inf per run of json rows
+        (the non-json rows were masked in _grammar). -> the masks."""
+        cons, g, b, js = self.cons, self.gm, self.gbits, []
+
+        def row(i):
+            if cons.state == 'json':
+                cons.m.fill_next_token_bitmask(b, i)
+                js.append(i)
+        k, bad = self._walk(kept, row)
+        assert k == kept and bad is None, (k, kept, bad)
+        ok = grammar.unpack(b[:js[-1] + 1], self.dev, non_blocking=self.dev.type == 'cuda')
+        a = 0
+        for n in range(1, len(js) + 1):
+            if n == len(js) or js[n] != js[n - 1] + 1:
+                r0, r1 = js[a], js[n - 1] + 1
+                g[r0:r1].masked_fill_(~ok[r0:r1], float('-inf'))
+                a = n
+        return g
 
 
 class SeqBatch(LoopBatch):
