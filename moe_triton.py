@@ -73,12 +73,12 @@ def _gemm_emu(x, w, s, gs, fp4):
     return acc.bfloat16()
 
 
-def emulate(u, sorted_e, tok, ws, w13, s13, gs13, w2, s2, gs2, fp4):
-    """CPU mirror of grouped(). Same arguments."""
+def emulate(u, sorted_e, tok, ws, w13, s13, gs13, w2, s2, gs2, fp4, out=None):
+    """CPU mirror of grouped(). Same arguments. out: optional fp32 [T,H] accumulator (returns it instead of bf16)."""
     E, NI = w13.shape[0], w13.shape[1] // 2
     be, b0, b1 = (t.tolist() for t in blocks(sorted_e, E, len(tok) // BM + E))
     act = torch.zeros(len(tok), NI, dtype=torch.bfloat16)
-    out = torch.zeros(u.shape, dtype=torch.float32)
+    acc = torch.zeros(u.shape, dtype=torch.float32) if out is None else out
     for e, r0, r1 in zip(be, b0, b1):
         if e < 0:
             continue
@@ -89,8 +89,8 @@ def emulate(u, sorted_e, tok, ws, w13, s13, gs13, w2, s2, gs2, fp4):
         if e < 0:
             continue
         y = _gemm_emu(act[r0:r1], w2[e], s2[e], gs2[e] if fp4 else None, fp4).float() * ws[r0:r1, None]
-        out.index_add_(0, tok[r0:r1], y)
-    return out.bfloat16()
+        acc.index_add_(0, tok[r0:r1], y)
+    return acc.bfloat16() if out is None else acc
 
 
 if triton is not None:
@@ -196,11 +196,12 @@ def blk(fp4, T):
     return BB, BS
 
 
-def grouped(u, sorted_e, tok, ws, w13, s13, gs13, w2, s2, gs2, fp4, fin=None, rt=None):
+def grouped(u, sorted_e, tok, ws, w13, s13, gs13, w2, s2, gs2, fp4, fin=None, rt=None, out=None):
     """u [T,H] bf16; sorted_e/tok/ws: expert, token and fp32 routing weight per routed row, sorted by expert.
     w13/s13 [E,2*NI,.], w2/s2 [E,H,.] packed as stored; gs* = amax/denominator [E] (NVFP4) or None.
     fin(y, tok, ws, T): replaces finish on the v2 / fp4 paths (INK_MOETAIL); the atomic path ignores it.
-    rt: moe_route.route() output for blk(fp4, T) (INK_MOE_ROUTE; v2 / fp4 paths only; sorted_e then unused)."""
+    rt: moe_route.route() output for blk(fp4, T) (INK_MOE_ROUTE; v2 / fp4 paths only; sorted_e then unused).
+    out: optional fp32 [T,H] accumulator for the v1 atomic path (returns it instead of bf16)."""
     if fp4act(fp4, u.shape[0]):
         import moe_fp4
         return moe_fp4.grouped(u, sorted_e, tok, ws, w13, s13, gs13, w2, s2, gs2, fin=fin, rt=rt)
@@ -213,14 +214,14 @@ def grouped(u, sorted_e, tok, ws, w13, s13, gs13, w2, s2, gs2, fp4, fin=None, rt
     be, b0, b1 = blocks(sorted_e, E, n_blk)
     tok32 = tok.int()
     act = torch.empty(len(tok), NI, dtype=torch.bfloat16, device=u.device)
-    out = torch.zeros(T, H, dtype=torch.float32, device=u.device)
+    acc = torch.zeros(T, H, dtype=torch.float32, device=u.device) if out is None else out
     _w13_kernel[(n_blk, NI // BN)](u, tok32, be, b0, b1, w13, s13, gs13 if fp4 else ws, act, H, NI,
                                    w13.stride(0), w13.stride(1), s13.stride(0), s13.stride(1),
                                    FP4=fp4, BM=BM, BN=BN, BK=BK, F32=INTERP)
-    _w2_kernel[(n_blk, H // BN)](act, tok32, ws, be, b0, b1, w2, s2, gs2 if fp4 else ws, out, NI, H,  # ws: unused stand-in pointer
+    _w2_kernel[(n_blk, H // BN)](act, tok32, ws, be, b0, b1, w2, s2, gs2 if fp4 else ws, acc, NI, H,  # ws: unused stand-in pointer
                                  w2.stride(0), w2.stride(1), s2.stride(0), s2.stride(1),
                                  FP4=fp4, BM=BM, BN=BN, BK=BK, F32=INTERP)
-    return out.bfloat16()
+    return acc.bfloat16() if out is None else acc
 
 
 # ------------------------------------------------------------------ v2 (INK_MOE_V2=1)

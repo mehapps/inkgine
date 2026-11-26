@@ -34,6 +34,7 @@ dspark.py / spec_runner.py at import) apply here as in tests/gpu_spec.py; with I
 target's FP8 unembed (shortlist head), not the bf16 one.
 """
 import base64
+import gc
 import hashlib
 import math
 import os
@@ -227,6 +228,8 @@ class Engine:
         self.mem_free = (lambda: torch.cuda.mem_get_info()[0]) if self.model.dev.type == 'cuda' else None  # tests fake it
         self.ooms = 0     # CUDA OOMs caught (prefill restarts + decode failures)
         self.vision_images = 0  # images run through the vision encoder (restored-prefix images skip it)
+        self._margin = None  # None: use module MARGIN; set in light mode (INK_LITE_MARGIN_MB)
+        self.lite, self.lite_keep_core, self._full_state = False, 0, None
         grammar.compiler(self.tok)  # build the xgrammar vocab once at startup (~3 s)
 
     @property
@@ -347,6 +350,21 @@ class Engine:
         """Keep the state at len(keys) on the GPU (shared pages + cloned small state). st: a parked decode's state from
         the batch decoder (no 'f'; it doesn't supersede the prompt's own entry)."""
         P = len(keys)
+        if getattr(self, 'lite', False):  # light mode: publish pages and spill directly to disk (0 GPU-parked states)
+            self.pool.publish(seq.kv, keys, P, keep)
+            if keep and self.pool.dir:
+                try:
+                    st = self.state_of(seq, f) if st is None else st
+                    tbl = self.pool.fork(seq.kv, P)
+                except torch.OutOfMemoryError:
+                    print(f'park skipped at {P} tokens: CUDA OOM', flush=True)
+                    return
+                if tbl is not None:
+                    try:
+                        self.pool.save_state(tbl, keys, st)
+                    finally:
+                        self.pool.release(tbl)
+            return
         try:  # near the 1M limit the ~200 MB clone can OOM: skip parking, keep the finished prefill
             st = self.state_of(seq, f) if st is None else st
             tbl = self.pool.fork(seq.kv, P)
@@ -424,6 +442,110 @@ class Engine:
             self.ds, n = None, n + 1
         if n > len(self.ds_free) and self.model.dev.type == 'cuda':
             torch.cuda.empty_cache()
+
+    def _bd_spec(self):
+        """Lightweight descriptor to recreate self.bd on exit_lite without retaining any reference to it or its
+        Fused weight pointers (which otherwise pin offloaded expert tensors in VRAM)."""
+        bd = self.bd
+        cls = type(bd)
+        if isinstance(bd, SoloFused):
+            return ('solo', bd.bd.n, bd.bd.graph)
+        if isinstance(bd, SeqBatch):
+            return ('seq', bd.n, bd.dev_tok, getattr(bd, 'use_taps', True))
+        if isinstance(bd, LoopBatch):
+            return ('loop', cls, bd.n, bd.dec)
+        return ('batch', cls, bd.n, getattr(bd, 'graph', self.graph))
+
+    def _build_bd(self, spec):
+        kind = spec[0]
+        if kind == 'solo':
+            from decode_batch import BatchDecoder
+            return SoloFused(BatchDecoder(self.model, spec[1], graph=spec[2]), self.model)
+        if kind == 'seq':
+            return SeqBatch(self.model, spec[1], dev_tok=spec[2], taps=spec[3])
+        if kind == 'loop':
+            cls, slots, dec = spec[1], spec[2], spec[3]
+            return LoopBatch(self.model, slots, dec=dec) if cls is LoopBatch else cls(self.model, slots)
+        cls, slots, graph = spec[1], spec[2], spec[3]
+        return cls(self.model, slots, graph=graph)
+
+    def enter_lite(self, keep_core_layers=0, chunk=None, margin_mb=None):
+        """Enter (or reconfigure) light mode: drop decoder/drafter objects (freeing BatchDecoder.F's references to
+        expert tensors), offload routed MoE experts to zero-copy read-only mmap views, flush GPU-parked states, and
+        serve single-stream with prompt-lookup speculation."""
+        assert not self.bd.busy(), 'cannot enter light mode while decode slots are busy'
+        keep_core = max(0, min(12, int(keep_core_layers)))
+        keep_layers = set(range(6, 6 + keep_core))
+        if not getattr(self, 'lite', False):
+            self._full_state = (self._bd_spec(), self.chunk, self.spec, getattr(self, '_margin', None))
+            self.spec_off()
+            self.drop_drafter()
+            self.bd.drop()
+            self.bd = SeqBatch(self.model, 1, taps=False)  # drop old bd/Fused refs before offloading experts
+            while self.parked:
+                self.unpark(self.parked.pop(0))
+            self.model.W.offload_experts(keep_layers)
+            full_chunk, full_spec = self._full_state[1], self._full_state[2]
+            self.spec = 'lookup' if full_spec != 'off' else 'off'
+        else:
+            while self.parked:
+                self.unpark(self.parked.pop(0))
+            self.model.W.offload_experts(keep_layers)
+            full_chunk = self._full_state[1]
+        c = int(chunk if chunk is not None else os.environ.get('INK_LITE_CHUNK', 1024))
+        self.chunk = max(1, min(c, full_chunk))
+        mb = int(margin_mb if margin_mb is not None else os.environ.get('INK_LITE_MARGIN_MB', 512))
+        self._margin = max(0, mb) << 20
+        self.lite, self.lite_keep_core = True, keep_core
+        gc.collect()
+        if self.model.dev.type == 'cuda':
+            torch.cuda.empty_cache()
+        return self.lite_status()
+
+    def exit_lite(self):
+        """Leave light mode: reload all offloaded routed experts onto the device and rebuild full-mode decoder/config.
+        On CUDA OOM mid-reload or decoder rebuild, rolls back to light mode and re-raises."""
+        if not getattr(self, 'lite', False):
+            return self.lite_status()
+        assert not self.bd.busy(), 'cannot exit light mode while decode slots are busy'
+        self.model.W.reload_experts()
+        bd_spec, chunk, spec, margin = self._full_state
+        try:
+            new_bd = self._build_bd(bd_spec)
+        except torch.OutOfMemoryError:
+            self.model.W.offload_experts(set(range(6, 6 + self.lite_keep_core)))
+            gc.collect()
+            if self.model.dev.type == 'cuda':
+                torch.cuda.empty_cache()
+            raise
+        self.bd, self.chunk, self.spec, self._margin = new_bd, chunk, spec, margin
+        self._full_state = None
+        self.lite, self.lite_keep_core = False, 0
+        gc.collect()
+        if self.model.dev.type == 'cuda':
+            torch.cuda.empty_cache()
+        return self.lite_status()
+
+    def lite_status(self):
+        """Current light-mode state and VRAM stats (None when not on CUDA)."""
+        cuda = self.model.dev.type == 'cuda' and torch.cuda.is_available()
+        alloc_mb = res_mb = free_mb = None
+        if cuda:
+            free_b, _ = torch.cuda.mem_get_info(self.model.dev)
+            free_mb = round(free_b / (1 << 20), 1)
+            alloc_mb = round(torch.cuda.memory_allocated(self.model.dev) / (1 << 20), 1)
+            res_mb = round(torch.cuda.memory_reserved(self.model.dev) / (1 << 20), 1)
+        return {
+            'lite': bool(getattr(self, 'lite', False)),
+            'keep_core_layers': int(getattr(self, 'lite_keep_core', 0)),
+            'offloaded_layers': len(getattr(self.model.W, 'offloaded', ())),
+            'slots': self.slots,
+            'chunk': self.chunk,
+            'spec': self.spec,
+            'vram_allocated_mb': alloc_mb,
+            'vram_reserved_mb': res_mb,
+            'vram_free_mb': free_mb,
+        }
 
     def _spec(self, req, start=None):
         """req's Spec for this run (None: plain decoding), its drafter context starting at `start` (default req.P).
@@ -615,7 +737,8 @@ class Engine:
             ck = CKPT and req.keep and self.pool.dir
             if ck:  # end chunks on checkpoint boundaries (any split gives the same result)
                 b = min(b, (a // CKPT + 1) * CKPT)
-            self.free_vram(MARGIN * max(b - a, self.chunk // 2) // self.chunk, spec=True)
+            margin = MARGIN if getattr(self, '_margin', None) is None else self._margin
+            self.free_vram(margin * max(b - a, self.chunk // 2) // self.chunk, spec=True)
             x = m.embed(ids[a:b])
             if req.img:
                 img, img_pos = req.img

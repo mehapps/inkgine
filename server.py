@@ -4,9 +4,12 @@ Run: cd engine && PATH=$PWD/.venv/bin:$PATH .venv/bin/python server.py   (env: I
 INK_SPEC=dspark|lookup|off; body field `spec: false` turns speculative decoding off for one request)"""
 import asyncio
 import base64
+import collections
+import concurrent.futures
 import heapq
 import itertools
 import json
+import math
 import os
 
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')  # less fragmentation near the 32 GB limit
@@ -47,6 +50,7 @@ from engine import BadRequest, Engine, NoRoom, OutOfMemory
 
 SERVED = os.environ.get('INK_SERVED', 'inkling-2-mini')
 NOROOM_S = float(os.environ.get('INK_NOROOM_S', 30))  # NoRoom with nothing running this long: fail instead
+LITE_RETRY_S = 60.0  # watchdog re-arm delay if automatic exit_lite hits CUDA OOM
 DECODE_SHARE = float(os.environ.get('INK_DECODE_SHARE', 0.5))  # wall-time share of decode steps vs prefill chunks
 MIX_CHUNK = int(os.environ.get('INK_MIX_CHUNK', 2048))  # prefill chunk while decodes run (caps their stall)
 # short-first (default on; 0 = strict FIFO prefills as before): a waiting request whose uncached suffix is <= SHORT_MAX
@@ -115,8 +119,25 @@ def _instrument(eng):
         wrap(pool, '_load_page', lambda dt, out: out is not None and (_add('disk_pages', 1), _add('disk_page_s', dt)))
         wrap(pool, '_save', lambda dt, out: (_add('sync_write_s', dt), _add('sync_writes', 1)))
     if bd is not None:
-        wrap(bd, '_alloc', lambda dt, out: (_add('decoder_allocs', 1), _add('decoder_alloc_s', dt)))
+        _wrap_bd(bd)
     eng._tm_wrapped = True
+
+
+def _wrap_bd(bd):
+    """Wrap bd._alloc for decoder_allocs / decoder_alloc_s timing metrics (safe to call on a recreated bd)."""
+    fn = getattr(bd, '_alloc', None)
+    if not callable(fn) or getattr(fn, '_tm_wrapped', False):
+        return
+
+    def w(*a, **k):
+        t0 = time.perf_counter()
+        try:
+            return fn(*a, **k)
+        finally:
+            _add('decoder_allocs', 1)
+            _add('decoder_alloc_s', time.perf_counter() - t0)
+    w._tm_wrapped = True
+    setattr(bd, '_alloc', w)
 
 
 def timings(st):
@@ -185,6 +206,9 @@ class Scheduler:
         self.tp = self.td = 0.0  # prefill / decode time while both kinds run (time share)
         self.retry = 0.0         # blocked head: no admission attempt before this (reset when anything changes)
         self.dend = 0.0          # end of the last decode step if nothing else ran since (decode_gap_s)
+        self._lite_q = collections.deque()  # pending light-mode transitions: (enabled, kw, Future)
+        self._lite_timer = None             # active watchdog timer for auto-exiting light mode
+        self._timeout_at = None             # unix timestamp of the armed watchdog, or None
         _instrument(eng)
         threading.Thread(target=self._worker, daemon=True).start()
 
@@ -216,18 +240,110 @@ class Scheduler:
 
     def _iterate(self):
         with self.cv:
-            while not self.heap and not self.running():
+            while not self.heap and not self.running() and not self._lite_q:
                 self.cv.wait()
         for r in self.active():
             if r.cancel.is_set():
                 self._end(r, None)  # client gone: no park
+        if self._lite_q:
+            if self.prefill is not None:
+                self._preempt(self.prefill)
+            if not self.running():
+                return self._do_lite()
+            return self._step()  # drain active decodes cleanly before transitioning; admit nothing new
         self._admit()
         if self.running():
             return self._step()
         self.dend = 0.0
         with self.cv:  # blocked or only cancelled waiters: until a submit or the next retry
-            if self.heap:
+            if self.heap and not self._lite_q:
                 self.cv.wait(max(0.01, self.retry - time.time()) if self.retry else 1.0)
+
+    # ------------------------------------------------------------------ light mode
+    def set_lite(self, enabled, keep_core_layers=0, timeout_min=240.0, chunk=None, margin_mb=None):
+        """Queue a live light-mode transition on the scheduler thread -> Future resolving to lite_status()."""
+        fut = concurrent.futures.Future()
+        kw = dict(keep_core_layers=keep_core_layers, timeout_min=timeout_min, chunk=chunk, margin_mb=margin_mb)
+        with self.cv:
+            self._lite_q.append((bool(enabled), kw, fut))
+            self.retry = 0.0
+            self.cv.notify()
+        return fut
+
+    def _cancel_watchdog(self):
+        t = self._lite_timer
+        self._lite_timer = None
+        self._timeout_at = None
+        if t is not None:
+            t.cancel()
+
+    def _arm_watchdog(self, delay_s):
+        self._cancel_watchdog()
+        if delay_s and delay_s > 0:
+            self._timeout_at = time.time() + delay_s
+            t = threading.Timer(delay_s, self._watchdog_fire)
+            t.daemon = True
+            self._lite_timer = t
+            t.start()
+
+    def _watchdog_fire(self):
+        me = threading.current_thread()
+        with self.cv:
+            if self._lite_timer is me:
+                self._lite_timer = None
+                self._timeout_at = None
+        if not getattr(self.eng, 'lite', False):
+            return
+        try:
+            self.set_lite(False).result()
+            print('lite watchdog: auto-exited light mode', flush=True)
+        except torch.OutOfMemoryError as e:
+            print(f'lite watchdog: auto-exit OOM ({e}), retrying in {LITE_RETRY_S:g} s', flush=True)
+            with self.cv:
+                if getattr(self.eng, 'lite', False) and self._lite_timer is None:
+                    self._arm_watchdog(LITE_RETRY_S)
+        except Exception as e:
+            print(f'lite watchdog: auto-exit failed: {type(e).__name__}: {e}', flush=True)
+
+    def _do_lite(self):
+        with self.cv:
+            if not self._lite_q:
+                return
+            enabled, kw, fut = self._lite_q[0]
+        try:
+            if enabled:
+                timeout_min = kw.pop('timeout_min', 240.0)
+                res = self.eng.enter_lite(**kw)
+                with self.cv:
+                    self._arm_watchdog(timeout_min * 60.0 if timeout_min and timeout_min > 0 else 0.0)
+            else:
+                res = self.eng.exit_lite()
+                if getattr(self.eng, '_tm_wrapped', False) and getattr(self.eng, 'bd', None) is not None:
+                    _wrap_bd(self.eng.bd)
+                with self.cv:
+                    self._cancel_watchdog()
+            self.retry = 0.0
+            self.dend = 0.0
+            with self.cv:
+                self._lite_q.popleft()
+                st = self._lite_status_locked(res)
+            fut.set_result(st)
+        except BaseException as e:
+            with self.cv:
+                if self._lite_q and self._lite_q[0][2] is fut:
+                    self._lite_q.popleft()
+            fut.set_exception(e)
+
+    def _lite_status_locked(self, base):
+        st = dict(base)
+        st.update(transitioning=bool(self._lite_q), timeout_at=self._timeout_at,
+                  running=self.running(), queue_depth=len(self.heap))
+        return st
+
+    def lite_status(self):
+        base = self.eng.lite_status()
+        with self.cv:
+            return self._lite_status_locked(base)
 
     # ------------------------------------------------------------------ admission
     def _admit(self):
@@ -463,11 +579,55 @@ def health():
     return {'ok': eng is not None}
 
 
+@app.get('/admin/lite')
+def get_lite():
+    if sched is None or eng is None:
+        return err(503, 'engine not ready')
+    return sched.lite_status()
+
+
+@app.post('/admin/lite')
+async def post_lite(request: Request):
+    if sched is None or eng is None:
+        return err(503, 'engine not ready')
+    try:
+        body = await request.json()
+    except ValueError:
+        return err(400, 'body is not JSON')
+    if not isinstance(body, dict):
+        return err(400, 'body must be an object')
+    enabled = body.get('enabled')
+    if not isinstance(enabled, bool):
+        return err(400, 'enabled must be a boolean')
+    keep = body.get('keep_core_layers', 0)
+    if isinstance(keep, bool) or not isinstance(keep, int) or not 0 <= keep <= 12:
+        return err(400, 'keep_core_layers must be an integer 0..12')
+    timeout_min = body.get('timeout_min', 240.0)
+    if isinstance(timeout_min, bool) or not isinstance(timeout_min, (int, float)) or not math.isfinite(timeout_min) or timeout_min < 0:
+        return err(400, 'timeout_min must be a non-negative number')
+    chunk = body.get('chunk')
+    if chunk is not None and (isinstance(chunk, bool) or not isinstance(chunk, int) or chunk < 1):
+        return err(400, 'chunk must be an integer >= 1')
+    margin_mb = body.get('margin_mb')
+    if margin_mb is not None and (isinstance(margin_mb, bool) or not isinstance(margin_mb, int) or margin_mb < 0):
+        return err(400, 'margin_mb must be an integer >= 0')
+    fut = sched.set_lite(enabled, keep_core_layers=keep, timeout_min=float(timeout_min),
+                         chunk=chunk, margin_mb=margin_mb)
+    try:
+        return await asyncio.wrap_future(fut)
+    except torch.OutOfMemoryError as e:
+        return err(503, f'out of GPU memory: {e}')
+    except Exception as e:
+        return err(500, f'{type(e).__name__}: {e}')
+
+
 @app.get('/metrics')
 def metrics():
     from fastapi.responses import PlainTextResponse
     g = dict(M, queue_depth=sched.depth() if sched else 0, running=sched.running() if sched else 0,
-             batch_size=len(sched.decoding) if sched else 0, slots=getattr(eng, 'slots', 0))
+             batch_size=len(sched.decoding) if sched else 0, slots=getattr(eng, 'slots', 0),
+             lite_mode=int(bool(getattr(eng, 'lite', False))),
+             offloaded_layers=len(getattr(getattr(getattr(eng, 'model', None), 'W', None), 'offloaded', ())))
     if getattr(eng, 'pool', None) is not None:
         g.update(kv_free_pages=eng.pool.free_pages(), parked=len(eng.parked), parked_bytes=eng.parked_bytes(),
                  ooms=eng.ooms, slot_decoders=sum(d is not None for d in getattr(getattr(eng, 'bd', None), 'decs', ())),
@@ -476,6 +636,7 @@ def metrics():
     lines = []
     for k, v in g.items():
         kind = 'gauge' if k.startswith('last_') or k in ('queue_depth', 'running', 'batch_size', 'slots',
+                                                         'lite_mode', 'offloaded_layers',
                                                          'kv_free_pages', 'parked', 'parked_bytes', 'slot_decoders',
                                                          'vram_allocated_bytes', 'warmup_seconds', 'batch_decoder') else 'counter'
         name = f'inkling_{k}' + ('_total' if kind == 'counter' else '')

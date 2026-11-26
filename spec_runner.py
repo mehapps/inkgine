@@ -515,9 +515,9 @@ class SeqBatch(LoopBatch):
     batch-invariance contract of decode_batch holds by construction); taps of every row via forward_taps, kept per
     slot by position for tap_hist."""
 
-    def __init__(self, model, slots=4, dev_tok=None):
+    def __init__(self, model, slots=4, dev_tok=None, taps=True):
         super().__init__(model, slots, dec=False)
-        self.pend, self.th, self.fw = {}, [{} for _ in range(slots)], 0
+        self.pend, self.th, self.fw, self.use_taps = {}, [{} for _ in range(slots)], 0, taps
         # step(rows, tok=...) as BatchDecoder's (tests the Spec device-id path on CPU; INK_DEC_EMBED_GPU=1 turns it on)
         self.dev_tok = os.environ.get('INK_DEC_EMBED_GPU') == '1' if dev_tok is None else dev_tok
 
@@ -540,15 +540,21 @@ class SeqBatch(LoopBatch):
         for slot, pos, t in rows:
             seq = self.seqs[slot]
             assert seq is not None and pos == seq.pos, (slot, pos, seq and seq.pos)
-            f, taps = forward_taps(m, m.embed([t]), seq)
+            if self.use_taps:
+                f, taps = forward_taps(m, m.embed([t]), seq)
+                tp.append(taps)
+                self.th[slot][pos] = taps[:, 0]
+                if len(self.th[slot]) > 96:
+                    for p in [p for p in self.th[slot] if p < pos - 64]:
+                        del self.th[slot][p]
+            else:
+                f = m.forward(m.embed([t]), seq)
             self.fw += 1
             lg.append(m.logits(f))
-            tp.append(taps)
-            self.th[slot][pos] = taps[:, 0]
             if n[slot] > 1:
                 self.pend.setdefault(slot, []).append(
                     (seq.pos, [{k: x.clone() for k, x in c.items()} for c in seq.conv], list(seq.ring)))
-        self.taps = torch.cat(tp, 1)
+        self.taps = torch.cat(tp, 1) if tp else None
         return torch.cat(lg)
 
     def commit(self, acc=None):

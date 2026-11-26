@@ -4,8 +4,12 @@ One sequence per forward. KV for the 8 full-attention layer visits lives in a pa
 format) so 1M tokens fit next to the weights; each Seq reads and writes it through its page table (seq.kv); every visit also keeps the last 1023 keys in bf16 (Ring), so all
 attention within distance < 1024 (where the relative bias lives) is exact bf16.
 """
+import json
 import math
+import mmap
 import os
+import struct
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -87,11 +91,15 @@ class Weights:
     """Text weights. On cuda everything is resident (experts stay packed); on cpu the expert tensors
     are lazy safetensors slices so a forward reads only the experts it routes to."""
     LAZY = ('w13_weight', 'w2_weight', 'w13_weight_scale', 'w2_weight_scale')
+    _ST_DTYPE = {'U8': torch.uint8, 'F8_E4M3': torch.float8_e4m3fn, 'BF16': torch.bfloat16,
+                 'F16': torch.float16, 'F32': torch.float32}
 
     def __init__(self, path, device):
         self.dev = torch.device(device)
-        f = safe_open(os.path.join(path, 'model-00001-of-00001.safetensors'), 'pt', device='cpu')
+        self.f_path = os.path.join(path, 'model-00001-of-00001.safetensors')
+        f = safe_open(self.f_path, 'pt', device='cpu')
         self.f, self.t = f, {}
+        self.offloaded, self._stage, self._stage_ev, self._stage_slot, self._mm = set(), {}, [None, None], 0, None
         for k in f.keys():
             if not k.startswith('model.llm.'):
                 continue
@@ -157,6 +165,154 @@ class Weights:
                 out.append((self.e2m1[codes] * s.float().repeat_interleave(16, -1) * gs).bfloat16())
             else:  # MXFP8, E8M0 scale per 32
                 out.append((q.float() * torch.exp2(s.float() - 127).repeat_interleave(32, -1)).bfloat16())
+        return out
+
+    def _mmap_view(self, n):
+        """Zero-copy read-only CPU tensor view into the safetensors file (OS-evictable page cache)."""
+        mm_info = getattr(self, '_mm', None)
+        if mm_info is None:
+            fh = open(self.f_path, 'rb')
+            hl = struct.unpack('<Q', fh.read(8))[0]
+            hdr = json.loads(fh.read(hl))
+            mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+            mm_info = self._mm = (fh, mm, hdr, 8 + hl)
+        _, mm, hdr, base = mm_info
+        meta = hdr['model.llm.' + n]
+        a, b = meta['data_offsets']
+        dt = self._ST_DTYPE[meta['dtype']]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', UserWarning)
+            return torch.frombuffer(mm, dtype=torch.uint8, count=b - a, offset=base + a).view(dt).view(meta['shape'])
+
+    def _offload_layer(self, L):
+        fp = getattr(self, 'f_path', None)
+        f = getattr(self, 'f', None)
+        for suf in self.LAZY:
+            n = f'layers.{L}.mlp.experts.{suf}'
+            if n in self.t:
+                if fp:
+                    self.t[n] = self._mmap_view(n)
+                elif f is not None:
+                    self.t[n] = f.get_slice('model.llm.' + n)
+                else:
+                    self.t[n] = self.t[n].cpu()
+        self.offloaded.add(L)
+
+    def _load_expert_tensor(self, n):
+        t = self.t[n]
+        if isinstance(t, torch.Tensor):
+            return t.to(self.dev) if t.device != self.dev else t.clone()
+        return self.f.get_tensor('model.llm.' + n).to(self.dev)
+
+    def _reload_layers(self, layers):
+        loaded = []
+        try:
+            for L in layers:
+                if L not in self.offloaded:
+                    continue
+                got = {}
+                for suf in self.LAZY:
+                    n = f'layers.{L}.mlp.experts.{suf}'
+                    if n in self.t:
+                        got[n] = self._load_expert_tensor(n)
+                self.t.update(got)
+                self.offloaded.discard(L)
+                loaded.append(L)
+        except torch.OutOfMemoryError:
+            got = None
+            for L in loaded:
+                self._offload_layer(L)
+            if self.dev.type == 'cuda':
+                torch.cuda.empty_cache()
+            raise
+
+    def offload_experts(self, keep_layers=()):
+        """Light mode: replace routed expert tensors for layers not in `keep_layers` with zero-copy read-only mmap
+        views (or slices / CPU tensors in tests without a file path); reload any offloaded layers now in `keep_layers`."""
+        if not hasattr(self, 'offloaded'):
+            self.offloaded = set()
+        keep = set(keep_layers)
+        for L in range(24):
+            if L not in keep and L not in self.offloaded and f'layers.{L}.mlp.experts.w13_weight' in self.t:
+                self._offload_layer(L)
+        to_reload = [L for L in sorted(self.offloaded) if L in keep]
+        if to_reload:
+            self._reload_layers(to_reload)
+        if not self.offloaded:
+            self.clear_stage()
+
+    def reload_experts(self):
+        """Reload all offloaded routed expert layers back onto self.dev and drop staging buffers. Rolls back on OOM."""
+        self.clear_stage()
+        if self.dev.type == 'cuda':
+            torch.cuda.empty_cache()
+        off = getattr(self, 'offloaded', None)
+        if off:
+            self._reload_layers(sorted(off))
+
+    def clear_stage(self):
+        """Free reusable host/device staging bounce buffers used by streamed offloaded MoE."""
+        evs = getattr(self, '_stage_ev', None)
+        if isinstance(evs, list):
+            for i, ev in enumerate(evs):
+                if ev is not None:
+                    ev.synchronize()
+                    evs[i] = None
+        elif evs is not None:
+            evs.synchronize()
+            self._stage_ev = [None, None]
+        self._stage_slot = 0
+        stage = getattr(self, '_stage', None)
+        if stage:
+            stage.clear()
+
+    def stage_experts(self, L, sub_e, cap=None):
+        """Fetch packed expert tensors (w13_weight, w13_weight_scale, w2_weight, w2_weight_scale) for expert ids
+        `sub_e` onto self.dev. On CUDA, gathers directly from mmap views into double-buffered pinned host bounce
+        buffers with per-slot events to overlap CPU gather with GPU execution."""
+        P = f'layers.{L}.mlp.experts.'
+        names = ('w13_weight', 'w13_weight_scale', 'w2_weight', 'w2_weight_scale')
+        srcs = [self.t[P + n] for n in names]
+        idx_cpu = torch.tensor(sub_e, dtype=torch.long)
+        if self.dev.type != 'cuda':
+            return [torch.index_select(s, 0, idx_cpu) if isinstance(s, torch.Tensor) else s[sub_e] for s in srcs]
+        k = len(sub_e)
+        S = max(k, cap or k)
+        stage = getattr(self, '_stage', None)
+        if stage is None:
+            stage = self._stage = {}
+        evs = getattr(self, '_stage_ev', None)
+        if not isinstance(evs, list):
+            evs = self._stage_ev = [None, None]
+        slot = getattr(self, '_stage_slot', 0)
+        self._stage_slot = 1 - slot
+        ev = evs[slot]
+        if ev is not None:
+            ev.synchronize()  # previous H2D copy on this bounce slot finished reading hb[slot]
+        out = []
+        for n, src in zip(names, srcs):
+            if isinstance(src, torch.Tensor):
+                shape, dt, tmp = tuple(src.shape[1:]), src.dtype, None
+            else:
+                tmp = src[sub_e]
+                shape, dt = tuple(tmp.shape[1:]), tmp.dtype
+            key = (n, shape, dt, S)
+            buf = stage.get(key)
+            if buf is None:
+                hbs = (torch.empty((S,) + shape, dtype=dt, pin_memory=True),
+                       torch.empty((S,) + shape, dtype=dt, pin_memory=True))
+                db = torch.empty((S,) + shape, dtype=dt, device=self.dev)
+                buf = stage[key] = (hbs, db)
+            hb, db = buf[0][slot], buf[1]
+            if tmp is None:
+                torch.index_select(src, 0, idx_cpu, out=hb[:k])
+            else:
+                hb[:k].copy_(tmp)
+            db[:k].copy_(hb[:k], non_blocking=True)
+            out.append(db[:k])
+        if ev is None:
+            ev = evs[slot] = torch.cuda.Event()
+        ev.record()
         return out
 
 
@@ -404,6 +560,7 @@ FP8_DECODE = os.environ.get('INK_FP8_DECODE', '0') == '1'
 FP8_KEEP_BF16 = [False]
 MOE_IMPL = os.environ.get('INK_MOE', 'torch')  # torch (per-expert dequant) | triton (grouped, packed) | emulate (cpu mirror)
 # | exact (torch loop with fp32 GEMMs rounded to bf16 at the §5 points: the reference for tests/gpu_check.py)
+LITE_EXPERT_BATCH = int(os.environ.get('INK_LITE_EXPERT_BATCH', 16))  # experts staged per batch when offloaded
 
 
 class Model:
@@ -557,7 +714,8 @@ class Model:
         idx = (s + W[P + 'gate.bias']).topk(8, -1).indices
         w = s.gather(1, idx)
         w = w / (w.sum(-1, keepdim=True) + 1e-20) * 8.0
-        if ROUTE[0] and impl == 'triton' and u.shape[0] >= 64 and (u.is_cuda or GLUE_CPU[0]):
+        off = L in getattr(W, 'offloaded', ())
+        if not off and ROUTE[0] and impl == 'triton' and u.shape[0] >= 64 and (u.is_cuda or GLUE_CPU[0]):
             import moe_route
             import moe_triton
             if moe_triton.V2 or moe_triton.fp4act(L < 20, u.shape[0]):
@@ -566,6 +724,8 @@ class Model:
         flat = idx.flatten()
         order = flat.argsort()
         tok, ws = order // 8, w.flatten()[order]
+        if off:
+            return self._moe_stream(L, u, flat[order], tok, ws, impl, tail)
         if impl not in ('torch', 'exact'):
             if tail is None:  # (tests stub moe_grouped with 6 args)
                 return self.moe_grouped(L, u, flat[order], tok, ws, impl)
@@ -585,6 +745,72 @@ class Model:
             out.index_add_(0, rows, mm(act.bfloat16(), w2).float() * ws[start:start + n, None])
             start += n
         return out.bfloat16()
+
+    def _moe_stream(self, L, u, sorted_e, tok, ws, impl, tail=None):
+        """Streamed MoE for offloaded layers: stage active experts in small batches of <= LITE_EXPERT_BATCH, run the
+        grouped/emulate/torch path on each batch's rows, accumulate in fp32, and apply tail once at the end."""
+        W, P, fp4 = self.W, f'layers.{L}.mlp.experts.', L < 20
+        S = max(1, int(LITE_EXPERT_BATCH))
+        acc = torch.zeros(u.shape, dtype=torch.float32, device=u.device)
+        if len(tok):
+            if u.shape[0] == 1:  # decode: 8 distinct experts, one host sync, no unique/repeat_interleave
+                ue_t, cnt_t = sorted_e, None
+                ue = ue_t.tolist()
+                cnts = [1] * len(ue)
+            else:
+                ue_t, cnt_t = torch.unique_consecutive(sorted_e, return_counts=True)
+                ue, cnts = torch.stack((ue_t, cnt_t)).tolist()
+            mm = (lambda a, b: (a.float() @ b.float().t()).bfloat16()) if impl == 'exact' else (lambda a, b: a @ b.t())
+            if impl not in ('torch', 'exact'):
+                import moe_triton
+                v2_or_fp4 = impl == 'triton' and (moe_triton.V2 or moe_triton.fp4act(fp4, u.shape[0]))
+            row_pos = 0
+            for i0 in range(0, len(ue), S):
+                sub_e = ue[i0:i0 + S]
+                sub_cnts = cnts[i0:i0 + S]
+                n_rows = sum(sub_cnts)
+                r0, r1 = row_pos, row_pos + n_rows
+                row_pos = r1
+                sub_tok, sub_ws = tok[r0:r1], ws[r0:r1]
+                w13, s13, w2, s2 = W.stage_experts(L, sub_e, cap=S)
+                if fp4:
+                    ei = ue_t[i0:i0 + S]
+                    gs13 = W[P + 'w13_weight_amax'][ei] / W[P + 'w13_weight_outer_scale_denominator'][0]
+                    gs2 = W[P + 'w2_weight_amax'][ei] / W[P + 'w2_weight_outer_scale_denominator'][0]
+                else:
+                    gs13 = gs2 = None
+                if impl in ('torch', 'exact'):
+                    off_j = 0
+                    for j, c in enumerate(sub_cnts):
+                        rows = sub_tok[off_j:off_j + c]
+                        if fp4:
+                            q13, sc13 = w13[j], s13[j]
+                            c13 = torch.stack((q13 & 15, q13 >> 4), -1).view(q13.shape[0], -1).long()
+                            dw13 = (W.e2m1[c13] * sc13.float().repeat_interleave(16, -1) * gs13[j]).bfloat16()
+                            q2, sc2 = w2[j], s2[j]
+                            c2 = torch.stack((q2 & 15, q2 >> 4), -1).view(q2.shape[0], -1).long()
+                            dw2 = (W.e2m1[c2] * sc2.float().repeat_interleave(16, -1) * gs2[j]).bfloat16()
+                        else:
+                            dw13 = (w13[j].float() * torch.exp2(s13[j].float() - 127).repeat_interleave(32, -1)).bfloat16()
+                            dw2 = (w2[j].float() * torch.exp2(s2[j].float() - 127).repeat_interleave(32, -1)).bfloat16()
+                        gu = mm(u[rows], dw13)
+                        g, up = gu[:, 0::2].float(), gu[:, 1::2].float()
+                        act = 4 * torch.tanh(g / 4) * torch.sigmoid(g) * 25 * torch.tanh(up / 25)
+                        acc.index_add_(0, rows, mm(act.bfloat16(), dw2).float() * sub_ws[off_j:off_j + c, None])
+                        off_j += c
+                else:
+                    sub_se = torch.arange(len(sub_e), dtype=sorted_e.dtype, device=sorted_e.device) if cnt_t is None \
+                        else torch.repeat_interleave(
+                            torch.arange(len(sub_e), dtype=sorted_e.dtype, device=sorted_e.device), cnt_t[i0:i0 + S])
+                    if impl != 'triton':
+                        moe_triton.emulate(u, sub_se, sub_tok, sub_ws, w13, s13, gs13, w2, s2, gs2, fp4, out=acc)
+                    elif v2_or_fp4:
+                        moe_triton.grouped(u, sub_se, sub_tok, sub_ws, w13, s13, gs13, w2, s2, gs2, fp4,
+                                           fin=lambda y, t_, w_, _T: acc.index_add_(0, t_, y.float() * w_[:, None]))
+                    else:
+                        moe_triton.grouped(u, sub_se, sub_tok, sub_ws, w13, s13, gs13, w2, s2, gs2, fp4, out=acc)
+        out = acc.bfloat16()
+        return res_out(out, *tail) if tail is not None else out
 
     def moe_grouped(self, L, u, sorted_e, tok, ws, impl=None, tail=None, rt=None):
         import moe_triton
