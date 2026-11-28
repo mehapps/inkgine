@@ -229,7 +229,7 @@ class Engine:
         self.ooms = 0     # CUDA OOMs caught (prefill restarts + decode failures)
         self.vision_images = 0  # images run through the vision encoder (restored-prefix images skip it)
         self._margin = None  # None: use module MARGIN; set in light mode (INK_LITE_MARGIN_MB)
-        self.lite, self.lite_keep_core, self._full_state = False, 0, None
+        self.lite, self.lite_keep_core, self.lite_ram_experts, self._full_state = False, 0, 'mmap', None
         grammar.compiler(self.tok)  # build the xgrammar vocab once at startup (~3 s)
 
     @property
@@ -469,13 +469,26 @@ class Engine:
         cls, slots, graph = spec[1], spec[2], spec[3]
         return cls(self.model, slots, graph=graph)
 
-    def enter_lite(self, keep_core_layers=0, chunk=None, margin_mb=None):
+    @staticmethod
+    def _lite_ram_layers(ram_experts, keep_layers):
+        if ram_experts == 'mmap':
+            return set()
+        if ram_experts == 'core':
+            return set(range(6, 18)) - keep_layers
+        if ram_experts == 'all':
+            return set(range(24)) - keep_layers
+        raise ValueError(f"ram_experts must be 'mmap', 'core', or 'all', got {ram_experts!r}")
+
+    def enter_lite(self, keep_core_layers=0, chunk=None, margin_mb=None, ram_experts='mmap'):
         """Enter (or reconfigure) light mode: drop decoder/drafter objects (freeing BatchDecoder.F's references to
-        expert tensors), offload routed MoE experts to zero-copy read-only mmap views, flush GPU-parked states, and
-        serve single-stream with prompt-lookup speculation."""
+        expert tensors), offload routed MoE experts to zero-copy read-only mmap views or owned CPU RAM tensors, flush
+        GPU-parked states, and serve single-stream with prompt-lookup speculation."""
+        if ram_experts not in ('mmap', 'core', 'all'):
+            raise ValueError(f"ram_experts must be 'mmap', 'core', or 'all', got {ram_experts!r}")
         assert not self.bd.busy(), 'cannot enter light mode while decode slots are busy'
         keep_core = max(0, min(12, int(keep_core_layers)))
         keep_layers = set(range(6, 6 + keep_core))
+        ram_layers = self._lite_ram_layers(ram_experts, keep_layers)
         if not getattr(self, 'lite', False):
             self._full_state = (self._bd_spec(), self.chunk, self.spec, getattr(self, '_margin', None))
             self.spec_off()
@@ -484,19 +497,19 @@ class Engine:
             self.bd = SeqBatch(self.model, 1, taps=False)  # drop old bd/Fused refs before offloading experts
             while self.parked:
                 self.unpark(self.parked.pop(0))
-            self.model.W.offload_experts(keep_layers)
+            self.model.W.offload_experts(keep_layers, ram_layers=ram_layers)
             full_chunk, full_spec = self._full_state[1], self._full_state[2]
             self.spec = 'lookup' if full_spec != 'off' else 'off'
         else:
             while self.parked:
                 self.unpark(self.parked.pop(0))
-            self.model.W.offload_experts(keep_layers)
+            self.model.W.offload_experts(keep_layers, ram_layers=ram_layers)
             full_chunk = self._full_state[1]
         c = int(chunk if chunk is not None else os.environ.get('INK_LITE_CHUNK', 1024))
         self.chunk = max(1, min(c, full_chunk))
         mb = int(margin_mb if margin_mb is not None else os.environ.get('INK_LITE_MARGIN_MB', 512))
         self._margin = max(0, mb) << 20
-        self.lite, self.lite_keep_core = True, keep_core
+        self.lite, self.lite_keep_core, self.lite_ram_experts = True, keep_core, ram_experts
         gc.collect()
         if self.model.dev.type == 'cuda':
             torch.cuda.empty_cache()
@@ -508,19 +521,21 @@ class Engine:
         if not getattr(self, 'lite', False):
             return self.lite_status()
         assert not self.bd.busy(), 'cannot exit light mode while decode slots are busy'
+        keep_layers = set(range(6, 6 + self.lite_keep_core))
+        ram_layers = self._lite_ram_layers(getattr(self, 'lite_ram_experts', 'mmap'), keep_layers)
         self.model.W.reload_experts()
         bd_spec, chunk, spec, margin = self._full_state
         try:
             new_bd = self._build_bd(bd_spec)
         except torch.OutOfMemoryError:
-            self.model.W.offload_experts(set(range(6, 6 + self.lite_keep_core)))
+            self.model.W.offload_experts(keep_layers, ram_layers=ram_layers)
             gc.collect()
             if self.model.dev.type == 'cuda':
                 torch.cuda.empty_cache()
             raise
         self.bd, self.chunk, self.spec, self._margin = new_bd, chunk, spec, margin
         self._full_state = None
-        self.lite, self.lite_keep_core = False, 0
+        self.lite, self.lite_keep_core, self.lite_ram_experts = False, 0, 'mmap'
         gc.collect()
         if self.model.dev.type == 'cuda':
             torch.cuda.empty_cache()
@@ -539,6 +554,8 @@ class Engine:
             'lite': bool(getattr(self, 'lite', False)),
             'keep_core_layers': int(getattr(self, 'lite_keep_core', 0)),
             'offloaded_layers': len(getattr(self.model.W, 'offloaded', ())),
+            'ram_experts': getattr(self, 'lite_ram_experts', 'mmap'),
+            'ram_layers': len(getattr(self.model.W, 'ram_layers', ())),
             'slots': self.slots,
             'chunk': self.chunk,
             'spec': self.spec,

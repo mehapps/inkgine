@@ -88,7 +88,7 @@ def test_weights_offload_and_reload():
         W.f_path = st_path
         W.f = safe_open(st_path, 'pt', device='cpu')
         W.t = {k[len('model.llm.'):]: W.f.get_tensor(k) for k in W.f.keys()}
-        W.offloaded, W._stage, W._stage_ev, W._stage_slot, W._mm = set(), {}, [None, None], 0, None
+        W.offloaded, W.ram_layers, W._stage, W._stage_ev, W._stage_slot, W._mm = set(), set(), {}, [None, None], 0, None
 
         # Offload all 24 layers -> zero-copy read-only mmap views
         orig_refs = [weakref.ref(W.t[f'layers.{L}.mlp.experts.{suf}']) for L in range(24) for suf in M.Weights.LAZY]
@@ -168,6 +168,122 @@ def test_weights_offload_and_reload():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_weights_ram_experts():
+    torch.manual_seed(7)
+    tmp = tempfile.mkdtemp(prefix='ink-lite-ram-')
+    try:
+        st_path = os.path.join(tmp, 'model-00001-of-00001.safetensors')
+        tensors = {}
+        for L in range(24):
+            p = f'model.llm.layers.{L}.mlp.experts.'
+            if L < 20:
+                tensors[p + 'w13_weight'] = torch.randint(0, 255, (4, 8, 8), dtype=torch.uint8)
+                tensors[p + 'w13_weight_scale'] = torch.ones((4, 8, 1), dtype=torch.float8_e4m3fn)
+                tensors[p + 'w2_weight'] = torch.randint(0, 255, (4, 8, 4), dtype=torch.uint8)
+                tensors[p + 'w2_weight_scale'] = torch.ones((4, 8, 1), dtype=torch.float8_e4m3fn)
+                tensors[p + 'w13_weight_amax'] = torch.ones(4)
+                tensors[p + 'w13_weight_outer_scale_denominator'] = torch.tensor([1.0])
+                tensors[p + 'w2_weight_amax'] = torch.ones(4)
+                tensors[p + 'w2_weight_outer_scale_denominator'] = torch.tensor([1.0])
+            else:
+                tensors[p + 'w13_weight'] = torch.randn((4, 8, 16)).to(torch.float8_e4m3fn)
+                tensors[p + 'w13_weight_scale'] = torch.randint(118, 124, (4, 8, 1), dtype=torch.uint8)
+                tensors[p + 'w2_weight'] = torch.randn((4, 8, 8)).to(torch.float8_e4m3fn)
+                tensors[p + 'w2_weight_scale'] = torch.randint(118, 124, (4, 8, 1), dtype=torch.uint8)
+        save_file(tensors, st_path)
+
+        W = object.__new__(M.Weights)
+        W.dev, W.e2m1, W.f_path = torch.device('cpu'), torch.tensor(M.E2M1), st_path
+        W.f = safe_open(st_path, 'pt', device='cpu')
+        W.t = {k[len('model.llm.'):]: W.f.get_tensor(k) for k in W.f.keys()}
+        W.offloaded, W.ram_layers, W._stage, W._stage_ev, W._stage_slot, W._mm = set(), set(), {}, [None, None], 0, None
+
+        def is_mmap_view(k):
+            t = W.t[k]
+            mv = W._mmap_view(k)
+            return isinstance(t, torch.Tensor) and t.data_ptr() == mv.data_ptr()
+
+        # 1) Direct offload with ram_layers=core (6..17) and keep_layers={6, 7} -> keep wins over ram_layers
+        keep2 = {6, 7}
+        core = set(range(6, 18))
+        W.offload_experts(keep_layers=keep2, ram_layers=core)
+        assert W.offloaded == set(range(24)) - keep2
+        assert W.ram_layers == core - keep2
+        for L in range(24):
+            for suf in M.Weights.LAZY:
+                k = f'layers.{L}.mlp.experts.{suf}'
+                t = W.t[k]
+                assert isinstance(t, torch.Tensor) and t.device.type == 'cpu'
+                assert torch.equal(t, tensors['model.llm.' + k])
+                if L in W.ram_layers:
+                    assert not is_mmap_view(k), f'layer {L} {suf} still shares mmap storage'
+                    assert t.untyped_storage().data_ptr() != W._mmap_view(k).untyped_storage().data_ptr()
+                elif L in W.offloaded:
+                    assert is_mmap_view(k), f'layer {L} {suf} should be a zero-copy mmap view'
+
+        # 2) Transition mmap -> all RAM (from offloaded mmap views)
+        W.offload_experts(keep_layers=(), ram_layers=range(24))
+        assert W.offloaded == set(range(24)) and W.ram_layers == set(range(24))
+        for L in range(24):
+            for suf in M.Weights.LAZY:
+                k = f'layers.{L}.mlp.experts.{suf}'
+                assert not is_mmap_view(k), f'layer {L} {suf} not detached from mmap'
+                assert torch.equal(W.t[k], tensors['model.llm.' + k])
+
+        # 3) Transition RAM -> mmap frees the owned RAM tensors
+        ram_refs = [weakref.ref(W.t[f'layers.{L}.mlp.experts.{suf}']) for L in range(24) for suf in M.Weights.LAZY]
+        W.offload_experts(keep_layers=(), ram_layers=())
+        gc.collect()
+        assert W.offloaded == set(range(24)) and W.ram_layers == set()
+        assert all(r() is None for r in ram_refs), 'switching RAM -> mmap leaked owned RAM tensors'
+        for L in range(24):
+            for suf in M.Weights.LAZY:
+                assert is_mmap_view(f'layers.{L}.mlp.experts.{suf}')
+
+        # 4) OOM rollback inside _reload_layers preserves ram_layers vs mmap backing
+        W.offload_experts(keep_layers=(), ram_layers=core)
+        assert W.ram_layers == core
+        real_load = W._load_expert_tensor
+
+        def fail_on_layer_10(n):
+            if n.startswith('layers.10.'):
+                raise torch.OutOfMemoryError('simulated OOM on layer 10')
+            return real_load(n)
+
+        W._load_expert_tensor = fail_on_layer_10
+        try:
+            W.reload_experts()
+            raise AssertionError('expected OutOfMemoryError')
+        except torch.OutOfMemoryError:
+            pass
+        finally:
+            W._load_expert_tensor = real_load
+        assert W.offloaded == set(range(24)) and W.ram_layers == core
+        for L in range(24):
+            k = f'layers.{L}.mlp.experts.w13_weight'
+            if L in core:
+                assert not is_mmap_view(k), f'rollback turned RAM layer {L} into mmap'
+            else:
+                assert is_mmap_view(k), f'rollback lost mmap view on layer {L}'
+            assert torch.equal(W.t[k], tensors['model.llm.' + k])
+
+        # 5) Clean reload clears ram_layers
+        W.reload_experts()
+        assert W.offloaded == set() and W.ram_layers == set()
+
+        # 6) Fallback without f_path (PySafeSlice): ram_layers materialize owned CPU tensors, others stay slices
+        W.f_path = None
+        W.offload_experts(keep_layers=(), ram_layers={6, 7})
+        assert W.offloaded == set(range(24)) and W.ram_layers == {6, 7}
+        assert isinstance(W.t['layers.6.mlp.experts.w13_weight'], torch.Tensor)
+        assert not isinstance(W.t['layers.0.mlp.experts.w13_weight'], torch.Tensor)
+        W.reload_experts()
+        assert W.offloaded == set() and W.ram_layers == set()
+        print('PASS 1c: Weights ram_layers (owned CPU detachment, mmap<->RAM transitions, OOM rollback, slice fallback)')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_streamed_moe_numerics():
     torch.manual_seed(42)
     tmp = tempfile.mkdtemp(prefix='ink-lite-moe-')
@@ -176,7 +292,7 @@ def test_streamed_moe_numerics():
     try:
         E = 24
         M.LITE_EXPERT_BATCH = 5  # forces 5 batches (5, 5, 5, 5, 4) across 24 experts
-        raw = _make_moe_tensors((0, 20), E)
+        raw = _make_moe_tensors((0, 6, 20), E)
         st_path = os.path.join(tmp, 'model-00001-of-00001.safetensors')
         save_file({'model.llm.' + k: v for k, v in raw.items()}, st_path)
 
@@ -184,7 +300,7 @@ def test_streamed_moe_numerics():
         m_res.W = object.__new__(M.Weights)
         m_res.W.dev, m_res.W.e2m1, m_res.W.f = torch.device('cpu'), torch.tensor(M.E2M1), None
         m_res.W.t = {k: v.clone() for k, v in raw.items()}
-        m_res.W.offloaded, m_res.W._stage, m_res.W._stage_ev = set(), {}, None
+        m_res.W.offloaded, m_res.W.ram_layers, m_res.W._stage, m_res.W._stage_ev = set(), set(), {}, None
 
         m_off = object.__new__(M.Model)
         m_off.W = object.__new__(M.Weights)
@@ -192,40 +308,66 @@ def test_streamed_moe_numerics():
         m_off.W.f_path = st_path
         m_off.W.f = safe_open(st_path, 'pt', device='cpu')
         m_off.W.t = {k: v.clone() for k, v in raw.items()}
-        m_off.W.offloaded, m_off.W._stage, m_off.W._stage_ev, m_off.W._stage_slot, m_off.W._mm = (
-            set(), {}, [None, None], 0, None)
+        m_off.W.offloaded, m_off.W.ram_layers, m_off.W._stage, m_off.W._stage_ev, m_off.W._stage_slot, m_off.W._mm = (
+            set(), set(), {}, [None, None], 0, None)
         m_off.W.offload_experts()
-        assert m_off.W.offloaded == {0, 20} and m_off.W._mm is not None
+        assert m_off.W.offloaded == {0, 6, 20} and m_off.W.ram_layers == set() and m_off.W._mm is not None
 
-        for L in (0, 20):
-            for T in (1, 64):
-                u = M.rms(torch.randn(T, M.H)).bfloat16()
-                for impl in ('torch', 'exact', 'emulate'):
-                    ref = m_res.moe(L, u, impl=impl)
-                    got = m_off.moe(L, u, impl=impl)
-                    assert torch.equal(ref, got), f'L={L} T={T} impl={impl}: max diff {(ref.float() - got.float()).abs().max()}'
-
-                # Check tail=(st, conv_w, r): res_out applied once at the end
-                st1 = torch.randn(3, M.H, dtype=torch.bfloat16)
-                st2 = st1.clone()
-                cw = torch.randn(M.H, 1, 4, dtype=torch.float32) * 0.1
-                r = torch.randn(T, M.H, dtype=torch.float32)
-                ref_y = m_res.moe(L, u, impl='torch')
-                ref_h, ref_hn = M.res_out(ref_y, st1, cw, r)
-                got_h, got_hn = m_off.moe(L, u, impl='torch', tail=(st2, cw, r))
-                assert torch.equal(ref_h, got_h) and torch.equal(ref_hn, got_hn) and torch.equal(st1, st2), (
-                    f'tail mismatch L={L} T={T}')
-
-            # Check Triton interpreter path (v1 atomic & v2 fin callback) at T=1 for both NVFP4 and MXFP8
-            u1 = M.rms(torch.randn(1, M.H)).bfloat16()
+        # Compare mmap, core (L=6 in RAM, L=0/20 mmap), and all (0, 6, 20 in RAM) against resident
+        modes = (('mmap', ()), ('core', range(6, 18)), ('all', range(24)))
+        inputs = {(L, T): M.rms(torch.randn(T, M.H)).bfloat16() for L in (0, 6, 20) for T in (1, 64)}
+        refs = {(L, T, impl): m_res.moe(L, inputs[(L, T)], impl=impl)
+                for L in (0, 6, 20) for T in (1, 64) for impl in ('torch', 'exact', 'emulate')}
+        triton_u1 = {L: M.rms(torch.randn(1, M.H)).bfloat16() for L in (0, 6, 20)}
+        triton_refs = {}
+        for L in (0, 6, 20):
             for v2 in (False, True):
                 moe_triton.V2 = v2
-                ref_t = m_res.moe(L, u1, impl='triton')
-                got_t = m_off.moe(L, u1, impl='triton')
-                du = (ref_t.view(torch.int16).int() - got_t.view(torch.int16).int()).abs()
-                assert du.max().item() <= 1, f'triton V2={v2} L={L} T=1 max ulp {du.max().item()}'
+                triton_refs[(L, v2)] = m_res.moe(L, triton_u1[L], impl='triton')
 
-        print('PASS 1b: streamed Model.moe == resident (T=1 & T=64, NVFP4 & MXFP8, torch/exact/emulate/triton, tail)')
+        mode_outs = {}
+        for mode, rl in modes:
+            m_off.W.offload_experts(ram_layers=rl)
+            exp_ram = ({0, 6, 20} & set(rl))
+            assert m_off.W.ram_layers == exp_ram, (mode, m_off.W.ram_layers, exp_ram)
+            for L in (0, 6, 20):
+                for T in (1, 64):
+                    u = inputs[(L, T)]
+                    for impl in ('torch', 'exact', 'emulate'):
+                        ref = refs[(L, T, impl)]
+                        got = m_off.moe(L, u, impl=impl)
+                        assert torch.equal(ref, got), (
+                            f'mode={mode} L={L} T={T} impl={impl}: max diff {(ref.float() - got.float()).abs().max()}')
+                        if impl == 'torch':
+                            mode_outs[(mode, L, T)] = got
+
+                    if mode == 'mmap' and L in (0, 20):
+                        # Check tail=(st, conv_w, r): res_out applied once at the end
+                        st1 = torch.randn(3, M.H, dtype=torch.bfloat16)
+                        st2 = st1.clone()
+                        cw = torch.randn(M.H, 1, 4, dtype=torch.float32) * 0.1
+                        r = torch.randn(T, M.H, dtype=torch.float32)
+                        ref_h, ref_hn = M.res_out(refs[(L, T, 'torch')], st1, cw, r)
+                        got_h, got_hn = m_off.moe(L, u, impl='torch', tail=(st2, cw, r))
+                        assert torch.equal(ref_h, got_h) and torch.equal(ref_hn, got_hn) and torch.equal(st1, st2), (
+                            f'tail mismatch L={L} T={T}')
+
+                # Check Triton interpreter path (v1 atomic & v2 fin callback) for mmap (0, 20) and RAM (6, 20)
+                if (mode == 'mmap' and L in (0, 20)) or (mode == 'core' and L == 6) or (mode == 'all' and L == 20):
+                    for v2 in (False, True):
+                        moe_triton.V2 = v2
+                        ref_t = triton_refs[(L, v2)]
+                        got_t = m_off.moe(L, triton_u1[L], impl='triton')
+                        du = (ref_t.view(torch.int16).int() - got_t.view(torch.int16).int()).abs()
+                        assert du.max().item() <= 1, f'mode={mode} triton V2={v2} L={L} T=1 max ulp {du.max().item()}'
+
+        for L in (0, 6, 20):
+            for T in (1, 64):
+                assert torch.equal(mode_outs[('mmap', L, T)], mode_outs[('core', L, T)])
+                assert torch.equal(mode_outs[('mmap', L, T)], mode_outs[('all', L, T)])
+
+        print('PASS 1b: streamed Model.moe == resident across mmap/core/all '
+              '(T=1 & T=64, NVFP4 & MXFP8, torch/exact/emulate/triton, tail)')
     finally:
         M.LITE_EXPERT_BATCH = old_batch
         moe_triton.V2 = old_v2
@@ -237,16 +379,19 @@ class MiniWeights:
     def __init__(self):
         self.dev = torch.device('cpu')
         self.offloaded = set()
+        self.ram_layers = set()
         self.fail_reload = False
 
-    def offload_experts(self, keep_layers=()):
+    def offload_experts(self, keep_layers=(), ram_layers=()):
         keep = set(keep_layers)
         self.offloaded = set(range(24)) - keep
+        self.ram_layers = set(ram_layers) - keep
 
     def reload_experts(self):
         if self.fail_reload:
             raise torch.OutOfMemoryError('CUDA out of memory (simulated)')
         self.offloaded.clear()
+        self.ram_layers.clear()
 
 
 class MiniModel:
@@ -351,7 +496,7 @@ def _make_mini_engine(cache_dir):
     E.ooms = 0
     E.vision_images = 0
     E._margin = None
-    E.lite, E.lite_keep_core, E._full_state = False, 0, None
+    E.lite, E.lite_keep_core, E.lite_ram_experts, E._full_state = False, 0, 'mmap', None
     return E
 
 
@@ -380,6 +525,8 @@ def test_engine_lite_lifecycle():
         assert res['lite'] is True
         assert res['keep_core_layers'] == 4
         assert res['offloaded_layers'] == 20
+        assert res['ram_experts'] == 'mmap'
+        assert res['ram_layers'] == 0
         assert res['slots'] == 1
         assert res['chunk'] == 512
         assert res['spec'] == 'lookup'
@@ -491,7 +638,7 @@ def test_no_expert_ref_leak():
         W.dev, W.e2m1, W.f_path = torch.device('cpu'), torch.tensor(M.E2M1), st_path
         W.f = safe_open(st_path, 'pt', device='cpu')
         W.t = {k[len('model.llm.'):]: W.f.get_tensor(k) for k in W.f.keys()}
-        W.offloaded, W._stage, W._stage_ev, W._stage_slot, W._mm = set(), {}, [None, None], 0, None
+        W.offloaded, W.ram_layers, W._stage, W._stage_ev, W._stage_slot, W._mm = set(), set(), {}, [None, None], 0, None
 
         class FakeFused:
             def __init__(self, vis):
@@ -545,6 +692,107 @@ def test_no_expert_ref_leak():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_engine_ram_experts_transitions():
+    tmp = tempfile.mkdtemp(prefix='ink-lite-eng-ram-')
+    try:
+        st_path = os.path.join(tmp, 'model-00001-of-00001.safetensors')
+        tensors = {}
+        for L in range(24):
+            p = f'model.llm.layers.{L}.mlp.experts.'
+            tensors[p + 'w13_weight'] = torch.randint(0, 255, (4, 8, 8), dtype=torch.uint8)
+            tensors[p + 'w13_weight_scale'] = torch.ones((4, 8, 1), dtype=torch.float8_e4m3fn)
+            tensors[p + 'w2_weight'] = torch.randint(0, 255, (4, 8, 4), dtype=torch.uint8)
+            tensors[p + 'w2_weight_scale'] = torch.ones((4, 8, 1), dtype=torch.float8_e4m3fn)
+        save_file(tensors, st_path)
+
+        W = object.__new__(M.Weights)
+        W.dev, W.e2m1, W.f_path = torch.device('cpu'), torch.tensor(M.E2M1), st_path
+        W.f = safe_open(st_path, 'pt', device='cpu')
+        W.t = {k[len('model.llm.'):]: W.f.get_tensor(k) for k in W.f.keys()}
+        W.offloaded, W.ram_layers, W._stage, W._stage_ev, W._stage_slot, W._mm = set(), set(), {}, [None, None], 0, None
+
+        eng = _make_mini_engine(tmp)
+        eng.model.W = W
+
+        # Invalid ram_experts raises ValueError without changing state
+        try:
+            eng.enter_lite(ram_experts='bogus')
+            raise AssertionError('expected ValueError')
+        except ValueError:
+            pass
+        assert eng.lite is False and W.offloaded == set() and W.ram_layers == set()
+
+        # Enter lite: mmap -> core -> core+keep -> all+keep -> all -> mmap
+        r = eng.enter_lite(keep_core_layers=0, ram_experts='mmap')
+        assert r['ram_experts'] == 'mmap' and r['ram_layers'] == 0 and r['offloaded_layers'] == 24
+        assert W.ram_layers == set()
+
+        r = eng.enter_lite(keep_core_layers=0, ram_experts='core')
+        assert r['ram_experts'] == 'core' and r['ram_layers'] == 12 and r['offloaded_layers'] == 24
+        assert W.ram_layers == set(range(6, 18))
+
+        r = eng.enter_lite(keep_core_layers=4, ram_experts='core')
+        assert r['ram_experts'] == 'core' and r['ram_layers'] == 8 and r['offloaded_layers'] == 20
+        assert W.ram_layers == set(range(10, 18)) and W.offloaded == set(range(24)) - {6, 7, 8, 9}
+
+        r = eng.enter_lite(keep_core_layers=4, ram_experts='all')
+        assert r['ram_experts'] == 'all' and r['ram_layers'] == 20 and r['offloaded_layers'] == 20
+        assert W.ram_layers == set(range(24)) - {6, 7, 8, 9}
+
+        r = eng.enter_lite(keep_core_layers=0, ram_experts='all')
+        assert r['ram_experts'] == 'all' and r['ram_layers'] == 24 and r['offloaded_layers'] == 24
+        assert W.ram_layers == set(range(24))
+
+        r = eng.enter_lite(keep_core_layers=0, ram_experts='mmap')
+        assert r['ram_experts'] == 'mmap' and r['ram_layers'] == 0 and r['offloaded_layers'] == 24
+        assert W.ram_layers == set()
+
+        # OOM rollback on exit_lite (both during reload_experts AND during _build_bd) preserves ram_layers
+        r = eng.enter_lite(keep_core_layers=2, ram_experts='core')
+        assert r['ram_experts'] == 'core' and r['ram_layers'] == 10 and W.ram_layers == set(range(8, 18))
+
+        # Case A: OOM during reload_experts
+        real_load = W._load_expert_tensor
+        W._load_expert_tensor = lambda n: (_ for _ in ()).throw(torch.OutOfMemoryError('reload OOM')) \
+            if n.startswith('layers.12.') else real_load(n)
+        try:
+            eng.exit_lite()
+            raise AssertionError('expected OutOfMemoryError')
+        except torch.OutOfMemoryError:
+            pass
+        finally:
+            W._load_expert_tensor = real_load
+        assert eng.lite is True and eng.lite_ram_experts == 'core'
+        assert W.offloaded == set(range(24)) - {6, 7} and W.ram_layers == set(range(8, 18))
+        st = eng.lite_status()
+        assert st['ram_experts'] == 'core' and st['ram_layers'] == 10
+
+        # Case B: OOM during _build_bd (after reload_experts succeeded)
+        real_build = eng._build_bd
+        eng._build_bd = lambda spec: (_ for _ in ()).throw(torch.OutOfMemoryError('build_bd OOM'))
+        try:
+            eng.exit_lite()
+            raise AssertionError('expected OutOfMemoryError')
+        except torch.OutOfMemoryError:
+            pass
+        finally:
+            eng._build_bd = real_build
+        assert eng.lite is True and eng.lite_ram_experts == 'core'
+        assert W.offloaded == set(range(24)) - {6, 7} and W.ram_layers == set(range(8, 18))
+        for L in range(8, 18):
+            k = f'layers.{L}.mlp.experts.w13_weight'
+            assert W.t[k].data_ptr() != W._mmap_view(k).data_ptr()
+
+        # Clean exit clears ram_layers and resets ram_experts to 'mmap'
+        r_out = eng.exit_lite()
+        assert r_out['lite'] is False and r_out['offloaded_layers'] == 0
+        assert r_out['ram_experts'] == 'mmap' and r_out['ram_layers'] == 0
+        assert W.offloaded == set() and W.ram_layers == set()
+        print('PASS 2c: Engine ram_experts transitions (mmap/core/all + keep overlap) & exit_lite OOM rollback')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ===================================================================== 3. Scheduler + /admin/lite + watchdog + /metrics
 class LiteFakeEngine(FakeEngine):
     def __init__(self, slots=4, chunk_s=0.04, step_s=0.02):
@@ -553,19 +801,26 @@ class LiteFakeEngine(FakeEngine):
         self.full_chunk = self.chunk
         self.lite = False
         self.lite_keep_core = 0
+        self.lite_ram_experts = 'mmap'
         self.spec = 'dspark'
-        self.model = SimpleNamespace(W=SimpleNamespace(offloaded=set()))
+        self.model = SimpleNamespace(W=SimpleNamespace(offloaded=set(), ram_layers=set()))
         self.fail_exit_count = 0
 
-    def enter_lite(self, keep_core_layers=0, chunk=None, margin_mb=None):
+    def enter_lite(self, keep_core_layers=0, chunk=None, margin_mb=None, ram_experts='mmap'):
+        if ram_experts not in ('mmap', 'core', 'all'):
+            raise ValueError(f"ram_experts must be 'mmap', 'core', or 'all', got {ram_experts!r}")
         keep = max(0, min(12, int(keep_core_layers)))
+        keep_layers = set(range(6, 6 + keep))
         self.lite = True
         self.lite_keep_core = keep
+        self.lite_ram_experts = ram_experts
         self.slots = 1
         self.chunk = min(int(chunk or 1024), self.full_chunk)
         self.spec = 'lookup'
-        self.model.W.offloaded = set(range(24)) - set(range(6, 6 + keep))
-        self.L('enter_lite', keep)
+        self.model.W.offloaded = set(range(24)) - keep_layers
+        self.model.W.ram_layers = (set() if ram_experts == 'mmap' else
+                                   (set(range(6, 18)) if ram_experts == 'core' else set(range(24))) - keep_layers)
+        self.L('enter_lite', keep, ram_experts)
         return self.lite_status()
 
     def exit_lite(self):
@@ -577,10 +832,12 @@ class LiteFakeEngine(FakeEngine):
             raise torch.OutOfMemoryError('simulated GPU OOM on exit_lite')
         self.lite = False
         self.lite_keep_core = 0
+        self.lite_ram_experts = 'mmap'
         self.slots = self.full_slots
         self.chunk = self.full_chunk
         self.spec = 'dspark'
         self.model.W.offloaded = set()
+        self.model.W.ram_layers = set()
         self.L('exit_lite')
         return self.lite_status()
 
@@ -589,6 +846,8 @@ class LiteFakeEngine(FakeEngine):
             'lite': self.lite,
             'keep_core_layers': self.lite_keep_core,
             'offloaded_layers': len(self.model.W.offloaded),
+            'ram_experts': self.lite_ram_experts,
+            'ram_layers': len(self.model.W.ram_layers),
             'slots': self.slots,
             'chunk': self.chunk,
             'spec': self.spec,
@@ -618,15 +877,35 @@ def test_scheduler_and_http_lite():
         assert r.status_code == 200
         d = r.json()
         assert d['lite'] is False and d['slots'] == 4 and d['transitioning'] is False and d['timeout_at'] is None
+        assert d['ram_experts'] == 'mmap' and d['ram_layers'] == 0
 
         for bad in (
             {}, {'enabled': 'yes'}, {'enabled': 1}, {'enabled': True, 'keep_core_layers': -1},
             {'enabled': True, 'keep_core_layers': 13}, {'enabled': True, 'keep_core_layers': True},
             {'enabled': True, 'timeout_min': -5}, {'enabled': True, 'timeout_min': True},
             {'enabled': True, 'chunk': 0}, {'enabled': True, 'margin_mb': -1},
+            {'enabled': True, 'ram_experts': 'invalid'}, {'enabled': True, 'ram_experts': 123},
+            {'enabled': True, 'ram_experts': None}, {'enabled': True, 'ram_experts': True},
+            {'enabled': True, 'ram_experts': []},
         ):
             rb = client.post('/admin/lite', json=bad)
             assert rb.status_code == 400, (bad, rb.status_code, rb.text)
+
+        # 3a2. Valid ram_experts values via POST/GET /admin/lite
+        for req_body, exp_mode, exp_ram, exp_off in (
+            ({'enabled': True, 'ram_experts': 'core', 'timeout_min': 0}, 'core', 12, 24),
+            ({'enabled': True, 'keep_core_layers': 4, 'ram_experts': 'core', 'timeout_min': 0}, 'core', 8, 20),
+            ({'enabled': True, 'keep_core_layers': 4, 'ram_experts': 'all', 'timeout_min': 0}, 'all', 20, 20),
+            ({'enabled': True, 'ram_experts': 'mmap', 'timeout_min': 0}, 'mmap', 0, 24),
+        ):
+            rr = client.post('/admin/lite', json=req_body)
+            assert rr.status_code == 200, (req_body, rr.text)
+            rd = rr.json()
+            assert rd['ram_experts'] == exp_mode and rd['ram_layers'] == exp_ram and rd['offloaded_layers'] == exp_off, rd
+            rg = client.get('/admin/lite').json()
+            assert rg['ram_experts'] == exp_mode and rg['ram_layers'] == exp_ram, rg
+        rx = client.post('/admin/lite', json={'enabled': False})
+        assert rx.status_code == 200 and rx.json()['ram_experts'] == 'mmap' and rx.json()['ram_layers'] == 0
 
         # 3b. Active decode drains cleanly, queued waiter waits until after enter_lite, /health stays responsive
         out = {}
@@ -714,8 +993,10 @@ def test_scheduler_and_http_lite():
 
 if __name__ == '__main__':
     test_weights_offload_and_reload()
+    test_weights_ram_experts()
     test_streamed_moe_numerics()
     test_engine_lite_lifecycle()
     test_no_expert_ref_leak()
+    test_engine_ram_experts_transitions()
     test_scheduler_and_http_lite()
     print('ALL LITE TESTS OK')

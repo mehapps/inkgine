@@ -99,7 +99,8 @@ class Weights:
         self.f_path = os.path.join(path, 'model-00001-of-00001.safetensors')
         f = safe_open(self.f_path, 'pt', device='cpu')
         self.f, self.t = f, {}
-        self.offloaded, self._stage, self._stage_ev, self._stage_slot, self._mm = set(), {}, [None, None], 0, None
+        self.offloaded, self.ram_layers, self._stage, self._stage_ev, self._stage_slot, self._mm = (
+            set(), set(), {}, [None, None], 0, None)
         for k in f.keys():
             if not k.startswith('model.llm.'):
                 continue
@@ -197,6 +198,23 @@ class Weights:
                 else:
                     self.t[n] = self.t[n].cpu()
         self.offloaded.add(L)
+        if hasattr(self, 'ram_layers'):
+            self.ram_layers.discard(L)
+
+    def _offload_layer_ram(self, L):
+        """Materialize layer L's routed experts as owned anonymous CPU tensors (detached from mmap/GPU)."""
+        for suf in self.LAZY:
+            n = f'layers.{L}.mlp.experts.{suf}'
+            if n in self.t:
+                t = self.t[n]
+                if isinstance(t, torch.Tensor):
+                    self.t[n] = t.to('cpu', copy=True)
+                else:
+                    self.t[n] = self.f.get_tensor('model.llm.' + n).to('cpu', copy=True)
+        self.offloaded.add(L)
+        if not hasattr(self, 'ram_layers'):
+            self.ram_layers = set()
+        self.ram_layers.add(L)
 
     def _load_expert_tensor(self, n):
         t = self.t[n]
@@ -205,11 +223,14 @@ class Weights:
         return self.f.get_tensor('model.llm.' + n).to(self.dev)
 
     def _reload_layers(self, layers):
+        if not hasattr(self, 'ram_layers'):
+            self.ram_layers = set()
         loaded = []
         try:
             for L in layers:
                 if L not in self.offloaded:
                     continue
+                was_ram = L in self.ram_layers
                 got = {}
                 for suf in self.LAZY:
                     n = f'layers.{L}.mlp.experts.{suf}'
@@ -217,23 +238,36 @@ class Weights:
                         got[n] = self._load_expert_tensor(n)
                 self.t.update(got)
                 self.offloaded.discard(L)
-                loaded.append(L)
+                self.ram_layers.discard(L)
+                loaded.append((L, was_ram))
         except torch.OutOfMemoryError:
             got = None
-            for L in loaded:
-                self._offload_layer(L)
+            for L, was_ram in loaded:
+                if was_ram:
+                    self._offload_layer_ram(L)
+                else:
+                    self._offload_layer(L)
             if self.dev.type == 'cuda':
                 torch.cuda.empty_cache()
             raise
 
-    def offload_experts(self, keep_layers=()):
-        """Light mode: replace routed expert tensors for layers not in `keep_layers` with zero-copy read-only mmap
-        views (or slices / CPU tensors in tests without a file path); reload any offloaded layers now in `keep_layers`."""
+    def offload_experts(self, keep_layers=(), ram_layers=()):
+        """Light mode: keep layers in `keep_layers` on self.dev, hold layers in `ram_layers - keep_layers` as owned
+        anonymous CPU RAM tensors, and back remaining layers with zero-copy read-only mmap views (or slices / CPU
+        tensors in tests without a file path)."""
         if not hasattr(self, 'offloaded'):
             self.offloaded = set()
+        if not hasattr(self, 'ram_layers'):
+            self.ram_layers = set()
         keep = set(keep_layers)
+        want_ram = set(ram_layers) - keep
         for L in range(24):
-            if L not in keep and L not in self.offloaded and f'layers.{L}.mlp.experts.w13_weight' in self.t:
+            if f'layers.{L}.mlp.experts.w13_weight' not in self.t or L in keep:
+                continue
+            if L in want_ram:
+                if L not in self.offloaded or L not in self.ram_layers:
+                    self._offload_layer_ram(L)
+            elif L not in self.offloaded or L in self.ram_layers:
                 self._offload_layer(L)
         to_reload = [L for L in sorted(self.offloaded) if L in keep]
         if to_reload:

@@ -260,10 +260,12 @@ class Scheduler:
                 self.cv.wait(max(0.01, self.retry - time.time()) if self.retry else 1.0)
 
     # ------------------------------------------------------------------ light mode
-    def set_lite(self, enabled, keep_core_layers=0, timeout_min=240.0, chunk=None, margin_mb=None):
+    def set_lite(self, enabled, keep_core_layers=0, timeout_min=240.0, chunk=None, margin_mb=None,
+                 ram_experts='mmap'):
         """Queue a live light-mode transition on the scheduler thread -> Future resolving to lite_status()."""
         fut = concurrent.futures.Future()
-        kw = dict(keep_core_layers=keep_core_layers, timeout_min=timeout_min, chunk=chunk, margin_mb=margin_mb)
+        kw = dict(keep_core_layers=keep_core_layers, timeout_min=timeout_min, chunk=chunk, margin_mb=margin_mb,
+                  ram_experts=ram_experts)
         with self.cv:
             self._lite_q.append((bool(enabled), kw, fut))
             self.retry = 0.0
@@ -611,8 +613,11 @@ async def post_lite(request: Request):
     margin_mb = body.get('margin_mb')
     if margin_mb is not None and (isinstance(margin_mb, bool) or not isinstance(margin_mb, int) or margin_mb < 0):
         return err(400, 'margin_mb must be an integer >= 0')
+    ram_experts = body.get('ram_experts', 'mmap')
+    if not isinstance(ram_experts, str) or ram_experts not in ('mmap', 'core', 'all'):
+        return err(400, "ram_experts must be 'mmap', 'core', or 'all'")
     fut = sched.set_lite(enabled, keep_core_layers=keep, timeout_min=float(timeout_min),
-                         chunk=chunk, margin_mb=margin_mb)
+                         chunk=chunk, margin_mb=margin_mb, ram_experts=ram_experts)
     try:
         return await asyncio.wrap_future(fut)
     except torch.OutOfMemoryError as e:
