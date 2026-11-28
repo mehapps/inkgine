@@ -18,7 +18,7 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')  # 
 # VRAM); INK_MOE_FP4ACT stays off (numerics change, waits for the user's OK: deploy/CUTOVER.md).
 # 2026-11-23 (user-approved): + fused prefill glue (GLUE/GLUE2, KL within noise, ~1.4x prefill), FP4-activation MoE,
 # FP8 decode weights (gate/needles/evals pass), DSpark shortlist + ctx buckets + device accept (window spec2).
-# Off on purpose: INK_FP8_DENSE (+3%, 1.5x noise), INK_SPEC_GATE (hurts json), INK_MOE_FP4_TERMS, GATEFUSE/MOETAIL/FARSKIP.
+# Off on purpose: INK_FP8_DENSE (+3%, 1.5x noise), INK_MOE_FP4_TERMS, GATEFUSE/MOETAIL/FARSKIP.
 CUDA_DEFAULTS = dict(INK_MOE='triton', INK_GRAPH='1', INK_CHUNK='4096', INK_PREFILL_ATTN='auto', INK_DEC_FUSE='1',
                      INK_DEC_FAR_DOT='1', INK_MOE_V2='1', INK_GLUE='triton', INK_GLUE2='1', INK_MOE_FP4ACT='1',
                      INK_FP8_DECODE='1', INK_DSPARK_SHORT='32768', INK_DSPARK_CTXB='1', INK_SPEC_ACCEPT_DEV='1',
