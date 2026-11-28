@@ -51,3 +51,15 @@ Kernel-level aggregate decode at B=4 (`gpu_decode2.py`): 401 tok/s at ~1k, 351 a
 | 16.7-megapixel image | TTFT 1.9-2.0 s |
 
 A warm turn that reuses a cached prefix (GPU or disk tier) only prefills the new suffix.
+
+## Lite mode (`/admin/lite`)
+
+Live expert offloading frees ~16.5 GB VRAM (~12.4 GB allocated, keeping the full 9 GB 1M 4-bit KV pool and vision) with zero downtime, using single-stream fused decode and direct PCIe DMA from exact-size `cudaHostAlloc` pinned RAM (`ram_experts`):
+
+| `ram_experts` | pinned host RAM | idle decode (tok/s) | enter / exit |
+|---|---|---|---|
+| `mmap` (0 layers pinned) | 0 GB | 4.3 | ~0.2 s / ~4.3 s |
+| `core` (12 looped layers = 75% of visits) | 6.5 GB | 7.1 | ~4.0 s / ~3.2 s |
+| `all` (all 24 layers) | 14.5 GB | 9.85 | ~13 s / ~4.3 s |
+
+Exiting lite mode pauses any active decode to the disk prefix cache and resumes it seamlessly in full mode (~90+ tok/s).

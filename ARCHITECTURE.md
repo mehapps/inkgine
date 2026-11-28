@@ -13,9 +13,10 @@ Replaces Qwen behind LiteLLM as the live model, with:
 
 ## Layers (each only talks to the one below)
 ```
-server.py      HTTP/OpenAI API, streaming, parsing, json_schema masks       (per request)
+server.py      HTTP/OpenAI API, streaming, parsing, json_schema masks,      (per request)
+               /admin/lite live VRAM offloading + auto-exit watchdog
 scheduler      queue by priority, admission by KV pages, chunked prefill    (NEW, replaces the global lock)
-               interleaved with batched decode, preemption
+               interleaved with batched decode, preemption (and decode pause on exit_lite)
 state          paged KV pool + per-seq conv/ring state, page tables,        (KV4/Seq today -> pages)
                prefix tree, GPU-parked states + disk tier (no host-RAM tier)
 model.py       fixed-shape Inkling forward over a batch of seq chunks        (single seq today)
@@ -26,7 +27,8 @@ kernels        packed NVFP4/MXFP8 grouped MoE, 4-bit-KV attention,          (tor
                decode (flag, off): one fp8 dense copy, weight-only, read by the decode kernels + unembed (INK_FP8_DECODE);
                decode speed flags (off, same math): unrolled K loops, PDL, L2 weight prefetch, fused w2 epilogue, FAR2 far
                attention (fixed even splits of the far range + vector merge: cost follows context, not pool size);
-               FAR3 (flag, off): leaner far kernel (int32 code words, exponent-bit int4 dequant, 3 CTAs/SM)
+               FAR3 (flag, off): leaner far kernel (int32 code words, exponent-bit int4 dequant, 3 CTAs/SM);
+               lite mode: Weights.offload_experts (mmap or exact-size cudaHostAlloc pinned RAM) + Fused PRE_ROUTED DMA staging
 ```
 
 ## Decisions that shape later work

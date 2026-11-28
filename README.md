@@ -9,6 +9,7 @@ stateless `/v1/responses` (the whole conversation in `input`; no `previous_respo
 - Prefix cache with a disk tier, so multi-turn agent sessions don't re-read their history
 - Continuous batching with priority queueing and preemption
 - CUDA-graph decode, fused decode kernels, DSpark / prompt-lookup speculative decoding
+- Live lite mode (`/admin/lite`): offloads MoE experts to `mmap` or pinned host RAM (Direct DMA), dropping VRAM to ~12.4 GB with zero downtime while keeping the 1M KV pool and vision active
 
 Speed on one 5090: ~145 tok/s single-stream decode at short context (~296 tok/s on code with DSpark), 73-80 tok/s at
 1M, 1M-token prefill in ~6.5 min. Full numbers in [BENCHMARKS.md](BENCHMARKS.md).
