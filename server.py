@@ -246,11 +246,17 @@ class Scheduler:
             if r.cancel.is_set():
                 self._end(r, None)  # client gone: no park
         if self._lite_q:
+            enabled = self._lite_q[0][0]
+            if not enabled and not getattr(self.eng, 'lite', False):
+                return self._do_lite()  # already in full mode: no-op without disturbing active work
             if self.prefill is not None:
                 self._preempt(self.prefill)
+            if not enabled and self.decoding:  # lite -> full: pause decodes so they resume at full speed
+                for r in list(self.decoding):
+                    self._preempt_decode(r)
             if not self.running():
                 return self._do_lite()
-            return self._step()  # drain active decodes cleanly before transitioning; admit nothing new
+            return self._step()  # enter_lite: drain active decodes cleanly before transitioning; admit nothing new
         self._admit()
         if self.running():
             return self._step()
@@ -446,6 +452,22 @@ class Scheduler:
         M['preemptions'] += 1
         self.submit(r)
 
+    def _preempt_decode(self, r):
+        global _cur
+        _cur = r
+        try:
+            if r.cancel.is_set():
+                return self._end(r, None)
+            if r in self.decoding:
+                self.decoding.remove(r)
+            self.eng.preempt_decode(r)
+        except Exception as e:
+            return self._fail(r, e)
+        finally:
+            _cur = None
+        M['preemptions'] += 1
+        self.submit(r)
+
     # ------------------------------------------------------------------ steps
     def _step(self):
         pf, dec = self.prefill, list(self.decoding)
@@ -485,9 +507,10 @@ class Scheduler:
             self.prefill = None
             t0 = time.time()
             self.eng.to_decode(pf, min(set(range(self.eng.slots)) - {r.slot for r in self.decoding}))
-            tm['first_token_s'], tm['ttft_at'] = time.time() - t0, time.time()
-            if 'arrive' in tm:
-                M['last_ttft_s'] = round(tm['ttft_at'] - tm['arrive'], 4)
+            if 'ttft_at' not in tm:
+                tm['first_token_s'], tm['ttft_at'] = time.time() - t0, time.time()
+                if 'arrive' in tm:
+                    M['last_ttft_s'] = round(tm['ttft_at'] - tm['arrive'], 4)
             M['last_restore_s'] = round(tm.get('restore_s', 0), 4)
         except NoRoom:  # an OOM restart couldn't get its pages back: wait in line again
             self.prefill = None

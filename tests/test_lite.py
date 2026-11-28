@@ -984,6 +984,38 @@ def test_scheduler_and_http_lite():
         assert idx_pre < idx_ent, eng.log
         assert client.post('/admin/lite', json={'enabled': False}).status_code == 200
 
+        # 3f2. Active decode in lite mode is paused on exit_lite and resumes seamlessly in full mode (incl. OOM retry)
+        assert client.post('/admin/lite', json={'enabled': True, 'timeout_min': 0}).status_code == 200
+        eng.log.clear()
+        out3b = {}
+        t_ld = threading.Thread(target=ask, args=('ldec', 1, 24, out3b))
+        t_ld.start()
+        time.sleep(0.10)  # ldec is mid-decode in lite mode
+        eng.fail_exit_count = 1
+        r_oom = client.post('/admin/lite', json={'enabled': False})
+        assert r_oom.status_code == 503 and eng.lite is True
+        time.sleep(0.08)  # ldec re-admitted in lite mode after OOM rollback
+        r_ok = client.post('/admin/lite', json={'enabled': False})
+        assert r_ok.status_code == 200 and r_ok.json()['lite'] is False
+        t_ld.join()
+        assert out3b['ldec'] == ''.join(f'ldec{i} ' for i in range(24)), out3b
+        idx_park = next(i for i, e in enumerate(eng.log) if e[:2] == ('parked', 'ldec'))
+        idx_exit = next(i for i, e in enumerate(eng.log) if e[0] == 'exit_lite')
+        idx_resume = next(i for i in range(idx_exit + 1, len(eng.log)) if eng.log[i][:2] == ('start', 'ldec'))
+        assert idx_park < idx_exit < idx_resume, eng.log
+
+        # 3f3. No-op exit_lite when already in full mode does not preempt an active decode
+        eng.log.clear()
+        out3c = {}
+        t_fd = threading.Thread(target=ask, args=('fdec', 1, 12, out3c))
+        t_fd.start()
+        time.sleep(0.08)
+        r_noop = client.post('/admin/lite', json={'enabled': False})
+        assert r_noop.status_code == 200 and r_noop.json()['lite'] is False
+        t_fd.join()
+        assert out3c['fdec'] == ''.join(f'fdec{i} ' for i in range(12)), out3c
+        assert not eng.has('parked', 'fdec'), eng.log
+
         # 3g. Watchdog auto-exit (including OOM retry)
         server.LITE_RETRY_S = 0.15
         eng.fail_exit_count = 1
