@@ -23,8 +23,9 @@ from model import WIN
 
 
 class LoopBatch:
-    def __init__(self, model, slots=4, dec=False):
+    def __init__(self, model, slots=4, dec=False, graph=None, fuse=None):
         self.m, self.n, self.dec = model, slots, dec
+        self.graph, self.fuse = graph, fuse
         self.seqs = [None] * slots     # loaded Seq per slot
         self.decs = [None] * slots     # dec=True: Decoder per slot (lazy)
         self.side = self.gpool = None  # shared by the slot Decoders' graphs (one cuBLAS workspace, one graph pool)
@@ -41,7 +42,12 @@ class LoopBatch:
         if self.dec:
             d = self.decs[slot]
             if d is None:
-                d = self.decs[slot] = Decoder(self.m, embed_dev=False)  # (no 0.9 GB table per slot; stream() unused)
+                kw = {}
+                if self.graph is not None:
+                    kw['graph'] = self.graph
+                if self.fuse is not None:
+                    kw['fuse'] = self.fuse
+                d = self.decs[slot] = Decoder(self.m, embed_dev=False, **kw)  # (no 0.9 GB table per slot; stream() unused)
                 if d.graph:  # Decoder._capture makes its own stream + pool only while these are None
                     if self.gpool is None:
                         self.side, self.gpool = torch.cuda.Stream(), torch.cuda.graph_pool_handle()

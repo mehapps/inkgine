@@ -10,6 +10,7 @@
    503 on exit OOM, watchdog auto-exit + OOM retry, Prometheus metrics.
 
 Run: cd engine-dev && PATH=$PWD/.venv/bin:$PATH .venv/bin/python tests/test_lite.py"""
+import ctypes
 import gc
 import os
 import shutil
@@ -30,6 +31,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 import chat
+import decode
+import decode_kernels as DK
 import engine
 import kvpool
 import model as M
@@ -380,18 +383,21 @@ class MiniWeights:
         self.dev = torch.device('cpu')
         self.offloaded = set()
         self.ram_layers = set()
+        self.pinned_layers = set()
         self.fail_reload = False
 
     def offload_experts(self, keep_layers=(), ram_layers=()):
         keep = set(keep_layers)
         self.offloaded = set(range(24)) - keep
         self.ram_layers = set(ram_layers) - keep
+        self.pinned_layers = set(self.ram_layers) if self.dev.type == 'cuda' else set()
 
     def reload_experts(self):
         if self.fail_reload:
             raise torch.OutOfMemoryError('CUDA out of memory (simulated)')
         self.offloaded.clear()
         self.ram_layers.clear()
+        self.pinned_layers.clear()
 
 
 class MiniModel:
@@ -527,6 +533,8 @@ def test_engine_lite_lifecycle():
         assert res['offloaded_layers'] == 20
         assert res['ram_experts'] == 'mmap'
         assert res['ram_layers'] == 0
+        assert res['pinned_layers'] == 0
+        assert res['decoder'] == 'seq'
         assert res['slots'] == 1
         assert res['chunk'] == 512
         assert res['spec'] == 'lookup'
@@ -803,7 +811,7 @@ class LiteFakeEngine(FakeEngine):
         self.lite_keep_core = 0
         self.lite_ram_experts = 'mmap'
         self.spec = 'dspark'
-        self.model = SimpleNamespace(W=SimpleNamespace(offloaded=set(), ram_layers=set()))
+        self.model = SimpleNamespace(W=SimpleNamespace(offloaded=set(), ram_layers=set(), pinned_layers=set()))
         self.fail_exit_count = 0
 
     def enter_lite(self, keep_core_layers=0, chunk=None, margin_mb=None, ram_experts='mmap'):
@@ -838,6 +846,7 @@ class LiteFakeEngine(FakeEngine):
         self.spec = 'dspark'
         self.model.W.offloaded = set()
         self.model.W.ram_layers = set()
+        self.model.W.pinned_layers = set()
         self.L('exit_lite')
         return self.lite_status()
 
@@ -848,6 +857,8 @@ class LiteFakeEngine(FakeEngine):
             'offloaded_layers': len(self.model.W.offloaded),
             'ram_experts': self.lite_ram_experts,
             'ram_layers': len(self.model.W.ram_layers),
+            'pinned_layers': len(self.model.W.pinned_layers),
+            'decoder': 'seq' if self.lite else 'batch',
             'slots': self.slots,
             'chunk': self.chunk,
             'spec': self.spec,
@@ -991,6 +1002,517 @@ def test_scheduler_and_http_lite():
         server.eng, server.sched, server.LITE_RETRY_S = old_eng, old_sched, old_retry
 
 
+# ===================================================================== 4. Fused Lite Mode (resident / dma / stage)
+def test_route_top8_kernel():
+    """_route_top8_kernel matches _w13_kernel's top-8 selection bit-for-bit, including tie breaking (lowest index)."""
+    torch.manual_seed(101)
+    H, NI = 64, 32
+    u = torch.randn(H, dtype=torch.bfloat16)
+    w13 = torch.randint(0, 256, (128, 2 * NI, H // 2), dtype=torch.uint8)
+    s13 = torch.ones((128, 2 * NI, H // 16), dtype=torch.float8_e4m3fn)
+    gs13 = torch.ones(128, dtype=torch.float32)
+
+    # Case 1: random scores + biases
+    s_rand = torch.sigmoid(torch.randn(128))
+    b_rand = torch.randn(128) * 0.2
+
+    # Case 2: deliberate ties right across the top-8 cutoff (slots 4..11 all tied at score 2.0)
+    s_tie = torch.linspace(0.1, 0.9, 128)
+    b_tie = torch.zeros(128)
+    for e in (5, 19, 40, 77):
+        b_tie[e] = 5.0 - s_tie[e]  # top 4 all tied at 5.0 -> expect [5, 19, 40, 77]
+    for e in (100, 3, 64, 12, 88, 25, 1, 99):
+        b_tie[e] = 2.0 - s_tie[e]  # next 8 all tied at 2.0 -> lowest 4 win: [1, 3, 12, 25]
+
+    # Case 3: all 128 scores identical -> expect [0, 1, 2, 3, 4, 5, 6, 7]
+    s_all = torch.full((128,), 0.5)
+    b_all = torch.zeros(128)
+
+    for label, s, b, exp_ids in (
+        ('random', s_rand, b_rand, None),
+        ('ties', s_tie, b_tie, [5, 19, 40, 77, 1, 3, 12, 25]),
+        ('all_equal', s_all, b_all, list(range(8))),
+    ):
+        idx_r, wt_r = torch.zeros(8, dtype=torch.int32), torch.zeros(8)
+        idx_w, wt_w = torch.zeros(8, dtype=torch.int32), torch.zeros(8)
+        act = torch.zeros(8, NI, dtype=torch.bfloat16)
+        DK._route_top8_kernel[(1,)](s, b, idx_r, wt_r)
+        DK._w13_kernel[(1, 8)](s, b, u, w13, s13, gs13, w13.stride(0), w13.stride(1), s13.stride(0), s13.stride(1),
+                               act, idx_w, wt_w, FP4=True, F32=True, H=H, NI=NI, BN=NI, BK=H)
+        assert torch.equal(idx_r, idx_w), (label, idx_r, idx_w)
+        assert torch.equal(wt_r, wt_w), (label, wt_r, wt_w)
+        if exp_ids is not None:
+            assert idx_r.tolist() == exp_ids, (label, idx_r.tolist(), exp_ids)
+    print('PASS 4a: _route_top8_kernel == _w13_kernel bit-exact (random, boundary ties, all-equal)')
+
+
+class _FakeHostAllocRT:
+    """CPU test mock for cudaHostAlloc(..., 0) / cudaFreeHost backed by real ctypes buffers."""
+    def __init__(self):
+        self.active = {}       # ptr -> (buf, nbytes)
+        self.alloc_calls = 0
+        self.freed = []
+        self.fail_on_call = None
+
+    def cudaHostAlloc(self, p_ref, nbytes_v, flags_v):
+        self.alloc_calls += 1
+        nb, fl = int(nbytes_v.value), int(flags_v.value)
+        assert fl == 0 and nb > 0, (nb, fl)
+        if self.fail_on_call is not None and self.alloc_calls == self.fail_on_call:
+            return 2  # cudaErrorMemoryAllocation
+        buf = ctypes.create_string_buffer(nb)
+        ptr = ctypes.addressof(buf)
+        assert ptr not in self.active, f'duplicate alloc addr {ptr:#x}'
+        self.active[ptr] = (buf, nb)
+        p_ref._obj.value = ptr
+        return 0
+
+    def cudaFreeHost(self, ptr_v):
+        ptr = int(ptr_v.value)
+        assert ptr in self.active, f'double/invalid cudaFreeHost of {ptr:#x}'
+        del self.active[ptr]
+        self.freed.append(ptr)
+        return 0
+
+
+def test_weights_pinned_lifecycle_and_dma():
+    """Weights pinned_layers lifecycle via cudaHostAlloc(..., 0) / cudaFreeHost (exact-size allocation, view/slice
+    lifetime, partial allocation failure rollback, OOM rollback, 0 leaked allocations) and stage_experts_dma."""
+    torch.manual_seed(13)
+    tmp = tempfile.mkdtemp(prefix='ink-lite-pin-')
+    try:
+        st_path = os.path.join(tmp, 'model-00001-of-00001.safetensors')
+        raw = _make_moe_tensors((0, 6, 7, 20), E=16, H=64, NI=32)
+        save_file({'model.llm.' + k: v for k, v in raw.items()}, st_path)
+
+        W = object.__new__(M.Weights)
+        W.dev, W.e2m1, W.f_path = torch.device('cpu'), torch.tensor(M.E2M1), st_path
+        W.f = safe_open(st_path, 'pt', device='cpu')
+        W.t = {k[len('model.llm.'):]: W.f.get_tensor(k) for k in W.f.keys()}
+        W.offloaded, W.ram_layers, W.pinned_layers = set(), set(), set()
+        W._stage, W._stage_ev, W._stage_slot, W._mm = {}, [None, None], 0, None
+
+        # On CPU, _offload_layer_ram leaves pinned_layers empty
+        W.offload_experts(ram_layers={6, 7, 20})
+        assert W.ram_layers == {6, 7, 20} and W.pinned_layers == set()
+
+        # stage_experts_dma == stage_experts on both NVFP4 (L=6) and MXFP8 (L=20)
+        for L in (6, 20):
+            sub_e = [15, 2, 11, 0, 7, 4, 9, 13]
+            st_a = W.stage_experts(L, sub_e, cap=8)
+            st_b = W.stage_experts_dma(L, sub_e, cap=8)
+            assert len(st_a) == len(st_b) == 4
+            for a, b in zip(st_a, st_b):
+                assert torch.equal(a, b), (L, a.shape, b.shape)
+        W.reload_experts()
+        assert W.offloaded == set() and W.ram_layers == set() and W.pinned_layers == set()
+
+        # Simulated CUDA cudaHostAlloc / cudaFreeHost lifecycle (no GPU needed)
+        fake_rt = _FakeHostAllocRT()
+        orig_cudart = M._CUDART
+        orig_load = W._load_expert_tensor
+        old_cuda_empty = torch.cuda.empty_cache
+        cache_releases = [0]
+
+        W.dev = SimpleNamespace(type='cuda')
+        W._load_expert_tensor = lambda n: W.t[n].clone() if isinstance(W.t[n], torch.Tensor) else W.f.get_tensor('model.llm.' + n)
+        W._release_pinned_cache = lambda: (gc.collect(), cache_releases.__setitem__(0, cache_releases[0] + 1))
+        M._CUDART = fake_rt
+        torch.cuda.empty_cache = lambda: None
+        try:
+            # 1) Direct _alloc_host_pinned slice/view lifetime: buffer stays alive while a slice or view exists,
+            #    and cudaFreeHost fires immediately once the last view is dropped.
+            t_test = M._alloc_host_pinned((4, 8, 8), torch.float8_e4m3fn, fake_rt)
+            p_test = int(t_test.data_ptr())
+            assert p_test in fake_rt.active and fake_rt.active[p_test][1] == 4 * 8 * 8
+            sl = t_test[1]
+            vw = sl.view(torch.uint8)
+            del t_test
+            gc.collect()
+            assert p_test in fake_rt.active, 'cudaFreeHost fired while slice/view still alive!'
+            del sl
+            gc.collect()
+            assert p_test in fake_rt.active, 'cudaFreeHost fired while view still alive!'
+            del vw
+            gc.collect()
+            assert p_test not in fake_rt.active and p_test in fake_rt.freed, 'cudaFreeHost did not fire after last view'
+            fake_rt.alloc_calls = 0
+            fake_rt.freed.clear()
+
+            # 2) Pin layers 6, 7, 20: layer 7 fails on its 2nd tensor (call 6) -> 1st tensor of layer 7 MUST be
+            #    freed immediately via cudaFreeHost, layer 7 falls back to unpinned RAM, layers 6 & 20 are pinned!
+            fake_rt.fail_on_call = 6
+            W.offload_experts(ram_layers={6, 7, 20})
+            assert W.offloaded == {0, 6, 7, 20}
+            assert W.ram_layers == {6, 7, 20}
+            assert W.pinned_layers == {6, 20}, W.pinned_layers
+            assert len(fake_rt.freed) == 1, 'partial alloc failure must immediately free earlier tensor of L=7'
+            assert len(fake_rt.active) == 8  # 4 exact-size tensors each for layers 6 and 20
+            for L in (6, 20):
+                for suf in M.Weights.LAZY:
+                    k = f'layers.{L}.mlp.experts.{suf}'
+                    t = W.t[k]
+                    assert torch.equal(t, raw[k])
+                    assert fake_rt.active[int(t.data_ptr())][1] == t.numel() * t.element_size()
+            del t
+            for suf in M.Weights.LAZY:
+                k = f'layers.7.mlp.experts.{suf}'
+                assert torch.equal(W.t[k], raw[k]) and int(W.t[k].data_ptr()) not in fake_rt.active
+
+            # 3) OOM mid-reload preserves pinned_layers (6, 20 pinned; 7 unpinned RAM; 0 mmap) with 0 leaked allocs
+            fake_rt.fail_on_call = None
+            real_l = W._load_expert_tensor
+
+            def fail_on_20(n):
+                if n.startswith('layers.20.'):
+                    raise torch.OutOfMemoryError('simulated reload OOM on layer 20')
+                return real_l(n)
+
+            W._load_expert_tensor = fail_on_20
+            try:
+                W.reload_experts()
+                raise AssertionError('expected OutOfMemoryError')
+            except torch.OutOfMemoryError:
+                pass
+            finally:
+                W._load_expert_tensor = real_l
+            gc.collect()
+            assert W.offloaded == {0, 6, 7, 20} and W.ram_layers == {6, 7, 20} and W.pinned_layers == {6, 20}
+            assert len(fake_rt.active) == 8
+
+            # 4) Switching pinned layers back to mmap frees all cudaHostAlloc buffers immediately
+            before = cache_releases[0]
+            W.offload_experts(ram_layers=())
+            assert W.ram_layers == set() and W.pinned_layers == set()
+            assert fake_rt.active == {}, f'leaked cudaHostAlloc buffers: {list(fake_rt.active)}'
+            assert cache_releases[0] > before
+
+            # 5) Re-pin, stage a fake DMA buffer in _stage, verify reload_experts frees all allocs & clears _stage
+            W.offload_experts(ram_layers={6, 20})
+            assert W.pinned_layers == {6, 20} and len(fake_rt.active) == 8
+            W._stage[('dma', 'w13_weight', (64, 32), torch.uint8, 8)] = (None, torch.empty(8, 64, 32, dtype=torch.uint8))
+            before = cache_releases[0]
+            W.reload_experts()
+            assert W.offloaded == set() and W.ram_layers == set() and W.pinned_layers == set()
+            assert fake_rt.active == {} and W._stage == {} and cache_releases[0] > before
+        finally:
+            M._CUDART = orig_cudart
+            torch.cuda.empty_cache = old_cuda_empty
+            W.dev = torch.device('cpu')
+            W._load_expert_tensor = orig_load
+        print('PASS 4b: Weights cudaHostAlloc/cudaFreeHost lifecycle (exact size/slice lifetime/partial fallback/OOM rollback) + stage_experts_dma')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _make_synthetic_fused_model(layers_keep=(), layers_pinned=(), H=None, NI=None):
+    """Build a synthetic Model + DecodeState + Fused with dimensions (H, NI) and E=128 experts."""
+    torch.manual_seed(202)
+    H = M.H if H is None else H
+    NI = DK.NI if NI is None else NI
+    W = object.__new__(M.Weights)
+    W.dev, W.e2m1, W.f, W.f_path = torch.device('cpu'), torch.tensor(M.E2M1), None, None
+    W.offloaded = set(range(24)) - set(layers_keep)
+    W.ram_layers = set(layers_pinned) - set(layers_keep)
+    W.pinned_layers = set(layers_pinned) - set(layers_keep)
+    W._stage, W._stage_ev, W._stage_slot, W._mm = {}, [None, None], 0, None
+
+    W.t = {}
+    W.proj, W.gcat = {}, {}
+    cat_slide = torch.zeros(6552 + 2048, H, dtype=torch.bfloat16)
+    cat_full = torch.zeros(6552 + 2112, H, dtype=torch.bfloat16)
+    z_h = torch.ones(H, dtype=torch.float32)
+    z_q = torch.zeros(H, dtype=torch.float32)
+    z_q3 = torch.zeros(3, H, dtype=torch.float32)
+    z_wo = torch.zeros(H, 3072, dtype=torch.bfloat16)
+    z_sc_h = torch.randn(H, 1, 4, dtype=torch.float32) * 0.1
+    z_sc_kv = torch.zeros(1024, 1, 4, dtype=torch.float32)
+    z_sc_dyn = torch.zeros(4, 1024, dtype=torch.float32)
+    z_qsc = torch.ones(M.NQ, M.HD, dtype=torch.float32)
+    z_rsc = torch.ones(M.NQ, 16, dtype=torch.float32)
+    z_rel = torch.zeros(16, M.WIN, dtype=torch.bfloat16)
+    z_down = torch.zeros(64, 2 * H, dtype=torch.bfloat16)
+    z_gcat = torch.zeros(2 * H, 64, dtype=torch.float32)
+    W.t['norm.weight'] = z_h
+    W.t['embed_norm.weight'] = z_h
+    W.t['attn_res.output_query'] = z_q
+
+    fp4_sh = (
+        torch.randint(0, 256, (128, 2 * NI, H // 2), dtype=torch.uint8),
+        (torch.rand(128, 2 * NI, H // 16) * 48 + 16).to(torch.float8_e4m3fn),
+        torch.randint(0, 256, (128, H, NI // 2), dtype=torch.uint8),
+        (torch.rand(128, H, NI // 16) * 48 + 16).to(torch.float8_e4m3fn),
+        torch.rand(128) + 0.5,
+        torch.tensor([2688.0]),
+        torch.rand(128) + 0.5,
+        torch.tensor([2688.0]),
+    )
+    mx_sh = (
+        torch.randn(128, 2 * NI, H).to(torch.float8_e4m3fn),
+        torch.randint(118, 124, (128, 2 * NI, H // 32), dtype=torch.uint8),
+        torch.randn(128, H, NI).to(torch.float8_e4m3fn),
+        torch.randint(118, 124, (128, H, NI // 32), dtype=torch.uint8),
+    )
+
+    for L in range(24):
+        P, A = f'layers.{L}.', f'layers.{L}.attn.'
+        full = L in M.FULL
+        if L:
+            W.t[f'attn_res.attn_queries.{L - 1}'] = z_q3 if full else z_q
+        W.t[f'attn_res.mlp_queries.{L}'] = z_q
+        if full:
+            for c in 'qkv':
+                W.t[P + f'{c}_input_norm.weight'] = z_h
+            W.proj[L] = (cat_full, [6552, 1056, 1056])
+            W.t[A + 'k_sconv.static_w'] = z_sc_dyn
+            W.t[A + 'v_sconv.static_w'] = z_sc_dyn
+        else:
+            W.t[P + 'attn_norm.weight'] = z_h
+            W.proj[L] = (cat_slide, [6552, 1024, 1024])
+            W.t[A + 'k_sconv.weight'] = z_sc_kv
+            W.t[A + 'v_sconv.weight'] = z_sc_kv
+        if L in M.CORE:
+            for c in ('attn', 'k', 'v', 'mlp'):
+                cp = f'layers.{L}.controllers.{c}.'
+                W.t[cp + 'down_weight'] = z_down
+                W.gcat[cp] = z_gcat
+        W.t[A + 'q_l2_clip.scale'] = z_qsc
+        W.t[A + 'rel_l2_clip.scale'] = z_rsc
+        W.t[A + 'rel_logits_proj.proj'] = z_rel
+        W.t[A + 'wo_ud.weight'] = z_wo
+        W.t[P + 'attn_sconv.weight'] = z_sc_h
+        W.t[P + 'mlp_sconv.weight'] = z_sc_h
+        W.t[P + 'mlp_norm.weight'] = z_h
+        W.t[P + 'mlp.gate.weight'] = torch.zeros(128, H, dtype=torch.float32)
+        W.t[P + 'mlp.gate.bias'] = torch.randn(128, dtype=torch.float32) * 0.2
+        E = P + 'mlp.experts.'
+        if L < 20:
+            W.t[E + 'w13_weight'] = fp4_sh[0]
+            W.t[E + 'w13_weight_scale'] = fp4_sh[1]
+            W.t[E + 'w2_weight'] = fp4_sh[2]
+            W.t[E + 'w2_weight_scale'] = fp4_sh[3]
+            W.t[E + 'w13_weight_amax'] = fp4_sh[4]
+            W.t[E + 'w13_weight_outer_scale_denominator'] = fp4_sh[5]
+            W.t[E + 'w2_weight_amax'] = fp4_sh[6]
+            W.t[E + 'w2_weight_outer_scale_denominator'] = fp4_sh[7]
+        else:
+            W.t[E + 'w13_weight'] = mx_sh[0]
+            W.t[E + 'w13_weight_scale'] = mx_sh[1]
+            W.t[E + 'w2_weight'] = mx_sh[2]
+            W.t[E + 'w2_weight_scale'] = mx_sh[3]
+
+    m = object.__new__(M.Model)
+    m.W, m.dev, m.d8 = W, torch.device('cpu'), None
+    m.slot = {v: i for i, v in enumerate(M.FULL_VISITS)}
+    m.mq = [torch.zeros(4, H, dtype=torch.float32) for _ in range(12)]
+    kv = M.KV4(len(M.FULL_VISITS), 256, 'cpu')
+    st = decode.DecodeState(torch.device('cpu'), kv)
+    if H != M.H:
+        for c in st.conv:
+            c['attn'] = torch.zeros(3, H, dtype=torch.bfloat16)
+            c['mlp'] = torch.zeros(3, H, dtype=torch.bfloat16)
+    x_raw = torch.zeros(1, H, dtype=torch.bfloat16)
+    out = torch.zeros(1, 16, dtype=torch.float32)
+    return m, st, DK.Fused(m, st, x_raw, out)
+
+
+def test_fused_moe_modes_and_mixed_visit():
+    """Fused MoE execution across resident / dma / stage on both NVFP4 (L=7/0) and MXFP8 (L=20/21) layers,
+    with both w2all=False and w2all=True, is bit-exact (max_abs_diff == 0). Also verifies full-size (H=2304, NI=1152)
+    mixed-layer Fused initialization, PF disabling on offloaded layers, and exact staging method dispatch."""
+    old_blk, old_h, old_ni = dict(DK.BLK), DK.H, DK.NI
+    try:
+        # 1) Full-size (H=2304, NI=1152) Fused.__init__ check: per-visit moe_mode, d['ex'], d['pf']['w13'], buffers
+        _, _, f_full_res = _make_synthetic_fused_model(layers_keep=range(24), layers_pinned=())
+        _, _, f_full_mix = _make_synthetic_fused_model(layers_keep=(6,), layers_pinned=(7, 20))
+        for d in f_full_res.vis:
+            assert d['moe_mode'] == 'resident' and d['ex'] is not None
+        assert not hasattr(f_full_res, 'idx07')
+        assert hasattr(f_full_mix, 'idx07') and f_full_mix.idx07.tolist() == list(range(8))
+        assert f_full_mix.gs13_8.shape == (8,) and f_full_mix.gs2_8.shape == (8,)
+        for d in f_full_mix.vis:
+            L = d['L']
+            if L == 6:
+                assert d['moe_mode'] == 'resident' and d['ex'] is not None
+            elif L in (7, 20):
+                assert d['moe_mode'] == 'dma' and d['ex'] is None and d['pf']['w13'] == {}
+            else:
+                assert d['moe_mode'] == 'stage' and d['ex'] is None and d['pf']['w13'] == {}
+        del f_full_res, f_full_mix
+
+        # 2) Compact-dim (H=256, NI=128) real Fused.visit() MoE execution via Triton CPU interpreter
+        DK.H, DK.NI = 256, 128
+        DK.BLK.update(w13=128, w2=256, w2a=256, w2f=256, kbk=256, kbk2=128)
+
+        m_res, st_res, f_res = _make_synthetic_fused_model(layers_keep=range(24), layers_pinned=(), H=256, NI=128)
+        m_mix, st_mix, f_mix = _make_synthetic_fused_model(layers_keep=(6,), layers_pinned=(7, 20), H=256, NI=128)
+
+        g = torch.Generator().manual_seed(303)
+        S_in = torch.sigmoid(torch.randn(128, generator=g))
+        U_in = M.rms(torch.randn(256, generator=g)).bfloat16()
+        R_in = torch.randn(256, generator=g) * 0.1
+        conv0 = torch.randn(3, 256, generator=g).bfloat16()
+
+        calls = {'stage': [], 'dma': []}
+        orig_st, orig_dm = m_mix.W.stage_experts, m_mix.W.stage_experts_dma
+        m_mix.W.stage_experts = lambda L, ids, cap=None: (calls['stage'].append(L), orig_st(L, ids, cap))[1]
+        m_mix.W.stage_experts_dma = lambda L, ids, cap=None: (calls['dma'].append(L), orig_dm(L, ids, cap))[1]
+
+        def run_moe_only(f, v, w2all):
+            f.w2all = w2all
+            f.S.copy_(S_in)
+            f.U.copy_(U_in)
+            f.R.copy_(R_in)
+            f.st.conv[v]['mlp'].copy_(conv0)
+            f.hbuf[v].zero_()
+            d = f.vis[v]
+            saved = {}
+            noop = lambda *a, **k: None
+
+            class NoopGrid:
+                def __getitem__(self, _):
+                    return noop
+
+            for name in ('_mix_kernel', '_gate_z_kernel', '_gate_out_kernel', '_proj_kernel', '_pre_kernel',
+                         '_wo_kernel', '_router_kernel'):
+                saved[name] = getattr(DK, name)
+                setattr(DK, name, NoopGrid())
+            orig_near = f.near
+            f.near = noop
+            try:
+                f.visit(v, d)
+            finally:
+                for name, fn in saved.items():
+                    setattr(DK, name, fn)
+                f.near = orig_near
+            return f.hbuf[v].clone(), f.st.conv[v]['mlp'].clone(), f.idx.clone(), f.wt.clone()
+
+        # Visit 6 (L=6, resident NVFP4), 7 (L=7, dma NVFP4), 44 (L=20, dma MXFP8),
+        # 0 (L=0, stage NVFP4), 45 (L=21, stage MXFP8)
+        for w2all in (False, True):
+            for v, label in ((6, 'NVFP4_L6_res'), (7, 'NVFP4_L7_dma'), (44, 'MXFP8_L20_dma'),
+                             (0, 'NVFP4_L0_stage'), (45, 'MXFP8_L21_stage')):
+                h_ref, c_ref, i_ref, w_ref = run_moe_only(f_res, v, w2all)
+                h_got, c_got, i_got, w_got = run_moe_only(f_mix, v, w2all)
+                assert torch.equal(h_ref, h_got) and torch.equal(c_ref, c_got), (w2all, label, 'h/conv')
+                assert torch.equal(i_ref, i_got) and torch.equal(w_ref, w_got), (w2all, label, 'idx/wt')
+
+        assert calls['dma'] == [7, 20, 7, 20], calls
+        assert calls['stage'] == [0, 21, 0, 21], calls
+        print('PASS 4c: Fused.visit MoE bit-exact (resident == dma == stage, NVFP4 & MXFP8, w2all False/True)')
+    finally:
+        DK.H, DK.NI = old_h, old_ni
+        DK.BLK.clear()
+        DK.BLK.update(old_blk)
+
+
+def test_engine_fused_lite_reconfig_and_leaks():
+    """Engine.enter_lite on CUDA uses fused LoopBatch(dec=True, graph=False, fuse=True) + spec='off', drops old
+    Fused/Decoder refs BEFORE offloading on every reconfiguration (core <-> all <-> mmap) and on exit_lite
+    (0 weakref / cudaHostAlloc leaks), and rolls back cleanly on exit_lite OOM."""
+    tmp = tempfile.mkdtemp(prefix='ink-lite-fused-eng-')
+    old_cuda_empty = torch.cuda.empty_cache
+    old_cudart = M._CUDART
+    try:
+        st_path = os.path.join(tmp, 'model-00001-of-00001.safetensors')
+        tensors = {}
+        for L in range(24):
+            p = f'model.llm.layers.{L}.mlp.experts.'
+            tensors[p + 'w13_weight'] = torch.randint(0, 255, (4, 8, 8), dtype=torch.uint8)
+            tensors[p + 'w13_weight_scale'] = torch.ones((4, 8, 1), dtype=torch.float8_e4m3fn)
+            tensors[p + 'w2_weight'] = torch.randint(0, 255, (4, 8, 4), dtype=torch.uint8)
+            tensors[p + 'w2_weight_scale'] = torch.ones((4, 8, 1), dtype=torch.float8_e4m3fn)
+        save_file(tensors, st_path)
+
+        fake_rt = _FakeHostAllocRT()
+
+        W = object.__new__(M.Weights)
+        W.dev, W.e2m1, W.f_path = SimpleNamespace(type='cuda'), torch.tensor(M.E2M1), st_path
+        W.f = safe_open(st_path, 'pt', device='cpu')
+        W.t = {k[len('model.llm.'):]: W.f.get_tensor(k) for k in W.f.keys()}
+        W.offloaded, W.ram_layers, W.pinned_layers = set(), set(), set()
+        W._stage, W._stage_ev, W._stage_slot, W._mm = {}, [None, None], 0, None
+        W._load_expert_tensor = lambda n: W.t[n].clone() if isinstance(W.t[n], torch.Tensor) else W.f.get_tensor('model.llm.' + n)
+        W._release_pinned_cache = lambda: gc.collect()
+
+        M._CUDART = fake_rt
+        torch.cuda.empty_cache = lambda: None
+
+        eng = _make_mini_engine(tmp)
+        eng.model.dev = W.dev
+        eng.model.W = W
+
+        r = eng.enter_lite(ram_experts='core')
+        assert r['lite'] is True and r['decoder'] == 'fused' and r['spec'] == 'off'
+        assert r['pinned_layers'] == 12 and r['ram_layers'] == 12 and len(fake_rt.active) == 48
+        assert isinstance(eng.bd, LoopBatch) and eng.bd.dec is True and eng.bd.graph is False and eng.bd.fuse is True
+
+        class _Obj:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        # Attach a fake warm Decoder + Fused holding refs to pinned/resident experts
+        fake_fused = _Obj(vis=[
+            {'ex': [W.t[f'layers.{L}.mlp.experts.{suf}'] for suf in M.Weights.LAZY]}
+            for L in range(6, 18)
+        ])
+        fake_dec = _Obj(fused=fake_fused, seq=None)
+        eng.bd.decs[0] = fake_dec
+        dec_ref = weakref.ref(fake_dec)
+        fused_ref = weakref.ref(fake_fused)
+        pin_refs = [weakref.ref(W.t[f'layers.{L}.mlp.experts.{suf}']) for L in range(6, 18) for suf in M.Weights.LAZY]
+        del fake_dec, fake_fused
+
+        # Reconfigure core -> mmap: old Decoder/Fused & pinned cudaHostAlloc buffers MUST be freed (0 leaks)!
+        r = eng.enter_lite(ram_experts='mmap')
+        gc.collect()
+        assert r['pinned_layers'] == 0 and r['ram_layers'] == 0 and r['decoder'] == 'fused'
+        assert fake_rt.active == {}, f'reconfigure leaked cudaHostAlloc buffers: {list(fake_rt.active)}'
+        assert dec_ref() is None and fused_ref() is None, 'reconfigure leaked old lite Decoder/Fused'
+        assert all(pr() is None for pr in pin_refs), 'reconfigure leaked pinned host expert tensors'
+
+        # Reconfigure to all, attach fake warm Decoder/Fused, test exit_lite OOM rollback then clean exit
+        r = eng.enter_lite(ram_experts='all')
+        assert r['pinned_layers'] == 24 and len(fake_rt.active) == 96
+        fake_fused2 = _Obj(vis=[
+            {'ex': [W.t[f'layers.{L}.mlp.experts.{suf}'] for suf in M.Weights.LAZY]}
+            for L in range(24)
+        ])
+        fake_dec2 = _Obj(fused=fake_fused2, seq=None)
+        eng.bd.decs[0] = fake_dec2
+        dec2_ref, fused2_ref = weakref.ref(fake_dec2), weakref.ref(fake_fused2)
+        del fake_dec2, fake_fused2
+
+        # OOM during _build_bd rolls back to fused LoopBatch with 24 pinned layers
+        real_build = eng._build_bd
+        eng._build_bd = lambda spec: (_ for _ in ()).throw(torch.OutOfMemoryError('build OOM'))
+        try:
+            eng.exit_lite()
+            raise AssertionError('expected OutOfMemoryError')
+        except torch.OutOfMemoryError:
+            pass
+        finally:
+            eng._build_bd = real_build
+        gc.collect()
+        assert dec2_ref() is None and fused2_ref() is None, 'exit_lite did not drop old lite Decoder/Fused before reload'
+        assert eng.lite is True and len(W.pinned_layers) == 24 and len(fake_rt.active) == 96
+        assert isinstance(eng.bd, LoopBatch) and eng.bd.dec is True and eng.bd.fuse is True
+
+        # Clean exit frees all pinned refs & cudaHostAlloc buffers and restores full mode
+        pin_refs2 = [weakref.ref(W.t[f'layers.{L}.mlp.experts.{suf}']) for L in range(24) for suf in M.Weights.LAZY]
+        ro = eng.exit_lite()
+        gc.collect()
+        assert ro['lite'] is False and ro['pinned_layers'] == 0
+        assert ro['decoder'] == 'batch' and ro['slots'] == 4 and ro['spec'] == 'dspark'
+        assert fake_rt.active == {}, f'exit_lite leaked cudaHostAlloc buffers: {list(fake_rt.active)}'
+        assert all(pr() is None for pr in pin_refs2), 'exit_lite leaked pinned host expert tensors'
+        print('PASS 4d: Engine fused lite reconfiguration (core/all/mmap), 0 weakref/alloc leaks, OOM rollback')
+    finally:
+        M._CUDART = old_cudart
+        torch.cuda.empty_cache = old_cuda_empty
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == '__main__':
     test_weights_offload_and_reload()
     test_weights_ram_experts()
@@ -999,4 +1521,8 @@ if __name__ == '__main__':
     test_no_expert_ref_leak()
     test_engine_ram_experts_transitions()
     test_scheduler_and_http_lite()
+    test_route_top8_kernel()
+    test_weights_pinned_lifecycle_and_dma()
+    test_fused_moe_modes_and_mixed_visit()
+    test_engine_fused_lite_reconfig_and_leaks()
     print('ALL LITE TESTS OK')

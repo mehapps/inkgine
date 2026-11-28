@@ -594,14 +594,9 @@ def _deq_dot(acc, w_ptr, s_ptr, rows, lwr, lsr, x_ptr, k0, gs, FP4: tl.constexpr
 
 
 @triton.jit
-def _w13_kernel(s_ptr, bias, u_ptr, w_ptr, sc_ptr, gs_ptr, lwe, lwr, lse, lsr, act, idx_ptr, wt_ptr,
-                FP4: tl.constexpr, F32: tl.constexpr, H: tl.constexpr, NI: tl.constexpr, BN: tl.constexpr,
-                BK: tl.constexpr, UNR: tl.constexpr = 0, PDL: tl.constexpr = False, PF: tl.constexpr = False, pfa=None, pfn=0, pfb=None, pfm=0):
-    """Program (n block, slot t): top-8 of sigmoid scores + bias (recomputed by every program, 128 values), expert of
-    slot t; gate/up rows (2n, 2n+1) dot u; act = bf16(softcap-SwiGLU). Program (0,0) stores the 8 ids + weights.
-    PF: prefetch this program's share of expert e's w2 (pfn bytes per expert at pfa) and its scales (pfm at pfb)."""
+def _route_top8_kernel(s_ptr, bias, idx_ptr, wt_ptr, PDL: tl.constexpr = False):
+    """1-program top-8 router (exact match to _w13_kernel's selection): scores = s + bias, lowest index wins ties."""
     _enter(PDL)
-    nb, t = tl.program_id(0), tl.program_id(1)
     ee = tl.arange(0, 128)
     sv = tl.load(s_ptr + ee)
     sc = sv + tl.load(bias + ee)
@@ -615,10 +610,41 @@ def _w13_kernel(s_ptr, bias, u_ptr, w_ptr, sc_ptr, gs_ptr, lwe, lwr, lse, lsr, a
         ws = tl.where(i8 == i, tl.sum(tl.where(ee == jj, sv, 0.), 0), ws)
         sc = tl.where(ee == jj, float('-inf'), sc)
     wn = ws / (tl.sum(ws, 0) + 1e-20) * 8.0
-    if nb == 0 and t == 0:
-        tl.store(idx_ptr + i8, ids)
-        tl.store(wt_ptr + i8, wn)
-    e = tl.sum(tl.where(i8 == t, ids, 0), 0).to(tl.int64)
+    tl.store(idx_ptr + i8, ids)
+    tl.store(wt_ptr + i8, wn)
+
+
+@triton.jit
+def _w13_kernel(s_ptr, bias, u_ptr, w_ptr, sc_ptr, gs_ptr, lwe, lwr, lse, lsr, act, idx_ptr, wt_ptr,
+                FP4: tl.constexpr, F32: tl.constexpr, H: tl.constexpr, NI: tl.constexpr, BN: tl.constexpr,
+                BK: tl.constexpr, UNR: tl.constexpr = 0, PDL: tl.constexpr = False, PF: tl.constexpr = False,
+                pfa=None, pfn=0, pfb=None, pfm=0, PRE_ROUTED: tl.constexpr = False):
+    """Program (n block, slot t): top-8 of sigmoid scores + bias (recomputed by every program, 128 values), expert of
+    slot t (PRE_ROUTED: slot t indexes directly into the 8 staged experts, skipping routing + idx/wt stores);
+    gate/up rows (2n, 2n+1) dot u; act = bf16(softcap-SwiGLU). Program (0,0) stores the 8 ids + weights.
+    PF: prefetch this program's share of expert e's w2 (pfn bytes per expert at pfa) and its scales (pfm at pfb)."""
+    _enter(PDL)
+    nb, t = tl.program_id(0), tl.program_id(1)
+    if PRE_ROUTED:
+        e = t.to(tl.int64)
+    else:
+        ee = tl.arange(0, 128)
+        sv = tl.load(s_ptr + ee)
+        sc = sv + tl.load(bias + ee)
+        i8 = tl.arange(0, 8)
+        ids = tl.zeros([8], tl.int32)
+        ws = tl.zeros([8], tl.float32)
+        for i in tl.static_range(8):
+            mx = tl.max(sc, 0)
+            jj = tl.min(tl.where(sc == mx, ee, 128), 0)
+            ids = tl.where(i8 == i, jj, ids)
+            ws = tl.where(i8 == i, tl.sum(tl.where(ee == jj, sv, 0.), 0), ws)
+            sc = tl.where(ee == jj, float('-inf'), sc)
+        wn = ws / (tl.sum(ws, 0) + 1e-20) * 8.0
+        if nb == 0 and t == 0:
+            tl.store(idx_ptr + i8, ids)
+            tl.store(wt_ptr + i8, wn)
+        e = tl.sum(tl.where(i8 == t, ids, 0), 0).to(tl.int64)
     if PF:
         _pf_part(pfa.to(tl.pointer_type(tl.uint8)) + e * pfn, pfn, nb, tl.num_programs(0))
         _pf_part(pfb.to(tl.pointer_type(tl.uint8)) + e * pfm, pfm, nb, tl.num_programs(0))
@@ -787,10 +813,13 @@ class Fused:
         self.pm, self.pl, self.pacc, self.plse = f32(nt, NQ), f32(nt, NQ), f32(nt, NQ, HD), f32(NQ)
         self.plan, self.vis = visit_plan(), []
         self.o, self.lk = kopts()                       # INK_DEC_* flags at construction (constexprs, launch kwargs)
+        self.o_nopf = dict(self.o, PF=False)
         self.w2all = OPT['W2ALL']
         # INK_FP8_DECODE (m.d8.dec at construction): proj / wo / unembed read the e4m3 copies (fp8_dense.Dense8)
         d8 = m.d8 if m.d8 is not None and m.d8.dec else None
         self.w8 = d8 is not None
+        offloaded = getattr(W, 'offloaded', ())
+        pinned = getattr(W, 'pinned_layers', ())
         keep = []  # tensors the pointer tables point at
         for v, (L, p, src, ent, new, ment, prev) in enumerate(self.plan):
             P, A = f'layers.{L}.', f'layers.{L}.attn.'
@@ -831,10 +860,15 @@ class Fused:
             d['mnwt'] = ptrs([d['mnw']])
             d['gw'], d['gb'] = W[P + 'mlp.gate.weight'].float().contiguous(), W[P + 'mlp.gate.bias'].float().contiguous()
             E = P + 'mlp.experts.'
-            ex = [W[E + n] for n in ('w13_weight', 'w13_weight_scale', 'w2_weight', 'w2_weight_scale')]
-            if not isinstance(ex[0], torch.Tensor):  # CPU: lazy safetensors slices -> mmap views
-                ex = [mmap_experts(W, E + n) for n in ('w13_weight', 'w13_weight_scale', 'w2_weight', 'w2_weight_scale')]
-            d['ex'] = ex
+            mode = 'resident' if L not in offloaded else ('dma' if L in pinned else 'stage')
+            d['moe_mode'] = mode
+            if mode == 'resident':
+                ex = [W[E + n] for n in ('w13_weight', 'w13_weight_scale', 'w2_weight', 'w2_weight_scale')]
+                if not isinstance(ex[0], torch.Tensor):  # CPU: lazy safetensors slices -> mmap views
+                    ex = [mmap_experts(W, E + n) for n in ('w13_weight', 'w13_weight_scale', 'w2_weight', 'w2_weight_scale')]
+                d['ex'] = ex
+            else:
+                d['ex'] = None
             fp4 = L < 20
             d['fp4'] = fp4
             if fp4:
@@ -845,13 +879,20 @@ class Fused:
             if full:
                 d['kv'] = kv_ptrs(st.kv, m.slot[v])
             self.vis.append(d)
+        if any(d['moe_mode'] in ('dma', 'stage') for d in self.vis):
+            self.idx07 = torch.arange(8, dtype=torch.int32, device=dev)
+            self.gs13_8 = f32(8)
+            self.gs2_8 = f32(8)
         nb = lambda t: t.numel() * t.element_size()
         for v, d in enumerate(self.vis):                # INK_DEC_L2PF targets (kernel -> the weight read after it)
             nx = self.vis[v + 1]['cat'] if v + 1 < len(self.vis) else None
-            w2, s2 = d['ex'][2], d['ex'][3]
+            pf_w13 = {}
+            if d['moe_mode'] == 'resident':
+                w2, s2 = d['ex'][2], d['ex'][3]
+                pf_w13 = dict(pfa=w2, pfn=w2.stride(0) * w2.element_size(), pfb=s2,
+                              pfm=s2.stride(0) * s2.element_size())
             d['pf'] = dict(near=dict(pfa=d['wo'], pfn=nb(d['wo'])), wo=dict(pfa=d['gw'], pfn=nb(d['gw'])),
-                           w13=dict(pfa=w2, pfn=w2.stride(0) * w2.element_size(), pfb=s2,
-                                    pfm=s2.stride(0) * s2.element_size()),
+                           w13=pf_w13,
                            w2=dict(pfa=nx, pfn=nb(nx)) if nx is not None else dict(pfa=self.S, pfn=0))
             rk, rv = st.ring[v] if getattr(st, 'ring', None) else (self.S, self.S)
             d['pf']['proj'] = dict(pfa=rk, pfn=nb(rk), pfb=rv, pfm=nb(rv)) if rk is not self.S else \
@@ -952,18 +993,39 @@ class Fused:
                                                     BH=BLK['gout'], num_warps=NW['gout'], **o, **lk)
             _router_kernel[(128 // BLK['router'],)](self.G, d['mnw'], self.U, d['gw'], self.S, NORM=True, F32=F,
                                                     H=H, CH=CH, RB=BLK['router'], num_warps=NW['router'], **o, **lk)
-        w13, s13, w2, s2 = d['ex']
-        _w13_kernel[(NI // BLK['w13'], 8)](self.S, d['gb'], self.U, w13, s13, d['gs13'], w13.stride(0), w13.stride(1),
-                                           s13.stride(0), s13.stride(1), self.act, self.idx, self.wt,
-                                           FP4=d['fp4'], F32=F, H=H, NI=NI, BN=BLK['w13'], BK=BLK['kbk'],
-                                           num_warps=NW['w13'], **o, **lk, **pf['w13'])
+        mode = d['moe_mode']
+        if mode == 'resident':
+            w13, s13, w2, s2 = d['ex']
+            _w13_kernel[(NI // BLK['w13'], 8)](self.S, d['gb'], self.U, w13, s13, d['gs13'], w13.stride(0), w13.stride(1),
+                                               s13.stride(0), s13.stride(1), self.act, self.idx, self.wt,
+                                               FP4=d['fp4'], F32=F, H=H, NI=NI, BN=BLK['w13'], BK=BLK['kbk'],
+                                               num_warps=NW['w13'], **o, **lk, **pf['w13'])
+            idx2, gs2 = self.idx, d['gs2']
+        else:
+            L = d['L']
+            _route_top8_kernel[(1,)](self.S, d['gb'], self.idx, self.wt, PDL=o['PDL'], **lk)
+            if d['fp4']:
+                idx_l = self.idx.to(torch.long)
+                torch.index_select(d['gs13'], 0, idx_l, out=self.gs13_8)
+                torch.index_select(d['gs2'], 0, idx_l, out=self.gs2_8)
+                gs13_s, gs2 = self.gs13_8, self.gs2_8
+            else:
+                gs13_s = gs2 = self.wt
+            ids = self.idx.tolist()
+            w13, s13, w2, s2 = (self.m.W.stage_experts_dma(L, ids, cap=8) if mode == 'dma'
+                                else self.m.W.stage_experts(L, ids, cap=8))
+            _w13_kernel[(NI // BLK['w13'], 8)](self.S, d['gb'], self.U, w13, s13, gs13_s, w13.stride(0), w13.stride(1),
+                                               s13.stride(0), s13.stride(1), self.act, self.idx, self.wt,
+                                               FP4=d['fp4'], F32=F, H=H, NI=NI, BN=BLK['w13'], BK=BLK['kbk'],
+                                               num_warps=NW['w13'], **self.o_nopf, **lk, PRE_ROUTED=True)
+            idx2 = self.idx07
         if self.w2all:
-            _w2all_kernel[(H // BLK['w2a'],)](self.act, self.idx, self.wt, w2, s2, d['gs2'], w2.stride(0), w2.stride(1),
+            _w2all_kernel[(H // BLK['w2a'],)](self.act, idx2, self.wt, w2, s2, gs2, w2.stride(0), w2.stride(1),
                                               s2.stride(0), s2.stride(1), conv['mlp'], d['mcw'], self.R, self.hbuf[v],
                                               FP4=d['fp4'], F32=F, H=H, NI=NI, BN=BLK['w2a'], BK=BLK['kbk2'],
                                               num_warps=NW['w2a'], **o, **lk, **pf['w2'])
             return
-        _w2_kernel[(H // BLK['w2'], 8)](self.act, self.idx, self.wt, w2, s2, d['gs2'], w2.stride(0), w2.stride(1),
+        _w2_kernel[(H // BLK['w2'], 8)](self.act, idx2, self.wt, w2, s2, gs2, w2.stride(0), w2.stride(1),
                                          s2.stride(0), s2.stride(1), self.part, FP4=d['fp4'], F32=F, H=H, NI=NI,
                                          BN=BLK['w2'], BK=BLK['kbk2'], num_warps=NW['w2'], **o, **lk, **pf['w2'])
         _w2_fin_kernel[(H // BLK['w2f'],)](self.part, conv['mlp'], d['mcw'], self.R, self.hbuf[v], F32=F, H=H,

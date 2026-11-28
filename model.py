@@ -4,12 +4,15 @@ One sequence per forward. KV for the 8 full-attention layer visits lives in a pa
 format) so 1M tokens fit next to the weights; each Seq reads and writes it through its page table (seq.kv); every visit also keeps the last 1023 keys in bf16 (Ring), so all
 attention within distance < 1024 (where the relative bias lives) is exact bf16.
 """
+import ctypes
+import gc
 import json
 import math
 import mmap
 import os
 import struct
 import warnings
+import weakref
 
 import torch
 import torch.nn.functional as F
@@ -87,6 +90,58 @@ l2clip = _glue(l2clip, lambda a: a[0].shape[0] >= 64)
 attn_res = _glue(attn_res, lambda a: a[1][0].shape[0] >= 64)
 
 
+_CUDART = None
+
+
+def _cudart():
+    global _CUDART
+    if _CUDART is None:
+        for name in ('libcudart.so', 'libcudart.so.13', 'libcudart.so.12'):
+            try:
+                lib = ctypes.CDLL(name)
+                lib.cudaHostAlloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint]
+                lib.cudaHostAlloc.restype = ctypes.c_int
+                lib.cudaFreeHost.argtypes = [ctypes.c_void_p]
+                lib.cudaFreeHost.restype = ctypes.c_int
+                _CUDART = lib
+                break
+            except Exception:
+                continue
+        else:
+            _CUDART = False
+    return _CUDART or None
+
+
+def _free_host(lib, ptr):
+    try:
+        lib.cudaFreeHost(ctypes.c_void_p(ptr))
+    except Exception:
+        pass
+
+
+def _alloc_host_pinned(shape, dtype, lib):
+    """Allocate an exact-size page-locked host tensor via cudaHostAlloc(..., cudaHostAllocDefault=0)
+    (zero CachingHostAllocator power-of-2 rounding waste, full PCIe DMA speed). Lifetime is tied to the C++
+    UntypedStorage via weakref.finalize on the underlying ctypes array, so cudaFreeHost runs once the last view dies."""
+    nb = math.prod(shape) * dtype.itemsize
+    if nb <= 0:
+        return None
+    p = ctypes.c_void_p()
+    if lib.cudaHostAlloc(ctypes.byref(p), ctypes.c_size_t(nb), ctypes.c_uint(0)) != 0 or not p.value:
+        return None
+    ptr = int(p.value)
+    try:
+        arr = (ctypes.c_uint8 * nb).from_address(ptr)
+        fin = weakref.finalize(arr, _free_host, lib, ptr)
+        fin.atexit = False
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', UserWarning)
+            return torch.frombuffer(arr, dtype=torch.uint8).view(dtype).view(shape)
+    except Exception:
+        _free_host(lib, ptr)
+        return None
+
+
 class Weights:
     """Text weights. On cuda everything is resident (experts stay packed); on cpu the expert tensors
     are lazy safetensors slices so a forward reads only the experts it routes to."""
@@ -99,8 +154,8 @@ class Weights:
         self.f_path = os.path.join(path, 'model-00001-of-00001.safetensors')
         f = safe_open(self.f_path, 'pt', device='cpu')
         self.f, self.t = f, {}
-        self.offloaded, self.ram_layers, self._stage, self._stage_ev, self._stage_slot, self._mm = (
-            set(), set(), {}, [None, None], 0, None)
+        self.offloaded, self.ram_layers, self.pinned_layers = set(), set(), set()
+        self._stage, self._stage_ev, self._stage_slot, self._mm = {}, [None, None], 0, None
         for k in f.keys():
             if not k.startswith('model.llm.'):
                 continue
@@ -185,6 +240,12 @@ class Weights:
             warnings.simplefilter('ignore', UserWarning)
             return torch.frombuffer(mm, dtype=torch.uint8, count=b - a, offset=base + a).view(dt).view(meta['shape'])
 
+    def _release_pinned_cache(self):
+        """Run GC (firing cudaFreeHost on dropped cudaHostAlloc tensors) and flush PyTorch's CachingHostAllocator."""
+        gc.collect()
+        if self.dev.type == 'cuda' and hasattr(torch._C, '_host_emptyCache'):
+            torch._C._host_emptyCache()
+
     def _offload_layer(self, L):
         fp = getattr(self, 'f_path', None)
         f = getattr(self, 'f', None)
@@ -200,21 +261,54 @@ class Weights:
         self.offloaded.add(L)
         if hasattr(self, 'ram_layers'):
             self.ram_layers.discard(L)
+        if hasattr(self, 'pinned_layers'):
+            self.pinned_layers.discard(L)
 
-    def _offload_layer_ram(self, L):
-        """Materialize layer L's routed experts as owned anonymous CPU tensors (detached from mmap/GPU)."""
+    def _offload_layer_ram(self, L, pin=None):
+        """Materialize layer L's routed experts as exact-size owned CPU tensors (detached from mmap/GPU). On CUDA,
+        allocates exact-size page-locked host memory via cudaHostAlloc(..., 0) for full PCIe DMA speed with zero
+        power-of-2 rounding waste, falling back cleanly to unpinned RAM on failure."""
+        if not hasattr(self, 'ram_layers'):
+            self.ram_layers = set()
+        if not hasattr(self, 'pinned_layers'):
+            self.pinned_layers = set()
+        want_pin = (self.dev.type == 'cuda') if pin is None else (bool(pin) and self.dev.type == 'cuda')
+        if want_pin:
+            lib = _cudart()
+            if lib is not None:
+                got = {}
+                ok = True
+                for suf in self.LAZY:
+                    n = f'layers.{L}.mlp.experts.{suf}'
+                    if n in self.t:
+                        src = self.t[n]
+                        if not isinstance(src, torch.Tensor):
+                            src = self.f.get_tensor('model.llm.' + n)
+                        dst = _alloc_host_pinned(src.shape, src.dtype, lib)
+                        if dst is None:
+                            ok = False
+                            break
+                        dst.copy_(src)
+                        got[n] = dst
+                if ok:
+                    self.t.update(got)
+                    self.offloaded.add(L)
+                    self.ram_layers.add(L)
+                    self.pinned_layers.add(L)
+                    return
+                got = None
+                gc.collect()
         for suf in self.LAZY:
             n = f'layers.{L}.mlp.experts.{suf}'
             if n in self.t:
                 t = self.t[n]
                 if isinstance(t, torch.Tensor):
-                    self.t[n] = t.to('cpu', copy=True)
+                    self.t[n] = t.to('cpu', copy=True).contiguous()
                 else:
-                    self.t[n] = self.f.get_tensor('model.llm.' + n).to('cpu', copy=True)
+                    self.t[n] = self.f.get_tensor('model.llm.' + n).to('cpu', copy=True).contiguous()
         self.offloaded.add(L)
-        if not hasattr(self, 'ram_layers'):
-            self.ram_layers = set()
         self.ram_layers.add(L)
+        self.pinned_layers.discard(L)
 
     def _load_expert_tensor(self, n):
         t = self.t[n]
@@ -225,12 +319,15 @@ class Weights:
     def _reload_layers(self, layers):
         if not hasattr(self, 'ram_layers'):
             self.ram_layers = set()
+        if not hasattr(self, 'pinned_layers'):
+            self.pinned_layers = set()
         loaded = []
         try:
             for L in layers:
                 if L not in self.offloaded:
                     continue
                 was_ram = L in self.ram_layers
+                was_pinned = L in self.pinned_layers
                 got = {}
                 for suf in self.LAZY:
                     n = f'layers.{L}.mlp.experts.{suf}'
@@ -239,12 +336,13 @@ class Weights:
                 self.t.update(got)
                 self.offloaded.discard(L)
                 self.ram_layers.discard(L)
-                loaded.append((L, was_ram))
+                self.pinned_layers.discard(L)
+                loaded.append((L, was_ram, was_pinned))
         except torch.OutOfMemoryError:
             got = None
-            for L, was_ram in loaded:
+            for L, was_ram, was_pinned in loaded:
                 if was_ram:
-                    self._offload_layer_ram(L)
+                    self._offload_layer_ram(L, pin=was_pinned)
                 else:
                     self._offload_layer(L)
             if self.dev.type == 'cuda':
@@ -253,12 +351,15 @@ class Weights:
 
     def offload_experts(self, keep_layers=(), ram_layers=()):
         """Light mode: keep layers in `keep_layers` on self.dev, hold layers in `ram_layers - keep_layers` as owned
-        anonymous CPU RAM tensors, and back remaining layers with zero-copy read-only mmap views (or slices / CPU
-        tensors in tests without a file path)."""
+        anonymous CPU RAM tensors (pinned on CUDA), and back remaining layers with zero-copy read-only mmap views
+        (or slices / CPU tensors in tests without a file path)."""
         if not hasattr(self, 'offloaded'):
             self.offloaded = set()
         if not hasattr(self, 'ram_layers'):
             self.ram_layers = set()
+        if not hasattr(self, 'pinned_layers'):
+            self.pinned_layers = set()
+        had_pinned = set(self.pinned_layers)
         keep = set(keep_layers)
         want_ram = set(ram_layers) - keep
         for L in range(24):
@@ -274,6 +375,8 @@ class Weights:
             self._reload_layers(to_reload)
         if not self.offloaded:
             self.clear_stage()
+        if had_pinned - self.pinned_layers:
+            self._release_pinned_cache()
 
     def reload_experts(self):
         """Reload all offloaded routed expert layers back onto self.dev and drop staging buffers. Rolls back on OOM."""
@@ -283,6 +386,7 @@ class Weights:
         off = getattr(self, 'offloaded', None)
         if off:
             self._reload_layers(sorted(off))
+        self._release_pinned_cache()
 
     def clear_stage(self):
         """Free reusable host/device staging bounce buffers used by streamed offloaded MoE."""
@@ -299,6 +403,35 @@ class Weights:
         stage = getattr(self, '_stage', None)
         if stage:
             stage.clear()
+            self._release_pinned_cache()
+
+    def stage_experts_dma(self, L, sub_e, cap=None):
+        """Direct DMA staging for pinned CPU layers: copies each requested expert slice directly from pinned host RAM
+        into a reusable GPU scratch buffer (no host bounce buffer or CPU index_select)."""
+        P = f'layers.{L}.mlp.experts.'
+        names = ('w13_weight', 'w13_weight_scale', 'w2_weight', 'w2_weight_scale')
+        srcs = [self.t[P + n] for n in names]
+        if self.dev.type != 'cuda':
+            idx_cpu = torch.tensor(sub_e, dtype=torch.long)
+            return [torch.index_select(s, 0, idx_cpu) if isinstance(s, torch.Tensor) else s[sub_e] for s in srcs]
+        k = len(sub_e)
+        S = max(k, cap or k)
+        stage = getattr(self, '_stage', None)
+        if stage is None:
+            stage = self._stage = {}
+        out = []
+        for n, src in zip(names, srcs):
+            shape, dt = tuple(src.shape[1:]), src.dtype
+            key = ('dma', n, shape, dt, S)
+            buf = stage.get(key)
+            if buf is None:
+                db = torch.empty((S,) + shape, dtype=dt, device=self.dev)
+                buf = stage[key] = (None, db)
+            db = buf[1]
+            for j, e in enumerate(sub_e):
+                db[j].copy_(src[e], non_blocking=True)
+            out.append(db[:k])
+        return out
 
     def stage_experts(self, L, sub_e, cap=None):
         """Fetch packed expert tensors (w13_weight, w13_weight_scale, w2_weight, w2_weight_scale) for expert ids

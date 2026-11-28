@@ -480,31 +480,38 @@ class Engine:
         raise ValueError(f"ram_experts must be 'mmap', 'core', or 'all', got {ram_experts!r}")
 
     def enter_lite(self, keep_core_layers=0, chunk=None, margin_mb=None, ram_experts='mmap'):
-        """Enter (or reconfigure) light mode: drop decoder/drafter objects (freeing BatchDecoder.F's references to
-        expert tensors), offload routed MoE experts to zero-copy read-only mmap views or owned CPU RAM tensors, flush
-        GPU-parked states, and serve single-stream with prompt-lookup speculation."""
+        """Enter (or reconfigure) light mode: drop decoder/drafter objects (freeing BatchDecoder.F / Fused references
+        to GPU or pinned expert tensors), offload routed MoE experts to zero-copy read-only mmap views or owned CPU
+        RAM tensors (pinned on CUDA for direct DMA), flush GPU-parked states, and serve single-stream with fused
+        decode on CUDA (or SeqBatch + prompt-lookup speculation otherwise)."""
         if ram_experts not in ('mmap', 'core', 'all'):
             raise ValueError(f"ram_experts must be 'mmap', 'core', or 'all', got {ram_experts!r}")
         assert not self.bd.busy(), 'cannot enter light mode while decode slots are busy'
+        use_fused = self.model.dev.type == 'cuda' and os.environ.get('INK_DEC_FUSE', '1') != '0'
         keep_core = max(0, min(12, int(keep_core_layers)))
         keep_layers = set(range(6, 6 + keep_core))
         ram_layers = self._lite_ram_layers(ram_experts, keep_layers)
-        if not getattr(self, 'lite', False):
+        was_lite = bool(getattr(self, 'lite', False))
+        if not was_lite:
             self._full_state = (self._bd_spec(), self.chunk, self.spec, getattr(self, '_margin', None))
             self.spec_off()
             self.drop_drafter()
-            self.bd.drop()
-            self.bd = SeqBatch(self.model, 1, taps=False)  # drop old bd/Fused refs before offloading experts
-            while self.parked:
-                self.unpark(self.parked.pop(0))
+        self.bd.drop()
+        self.bd = SeqBatch(self.model, 1, taps=False)  # drop old bd/Decoder/Fused refs before offloading experts
+        while self.parked:
+            self.unpark(self.parked.pop(0))
+        try:
             self.model.W.offload_experts(keep_layers, ram_layers=ram_layers)
-            full_chunk, full_spec = self._full_state[1], self._full_state[2]
-            self.spec = 'lookup' if full_spec != 'off' else 'off'
+        except torch.OutOfMemoryError:
+            if was_lite and use_fused:
+                self.bd = LoopBatch(self.model, 1, dec=True, graph=False, fuse=True)
+            raise
+        full_chunk, full_spec = self._full_state[1], self._full_state[2]
+        if use_fused:
+            self.bd = LoopBatch(self.model, 1, dec=True, graph=False, fuse=True)
+            self.spec = 'off'
         else:
-            while self.parked:
-                self.unpark(self.parked.pop(0))
-            self.model.W.offload_experts(keep_layers, ram_layers=ram_layers)
-            full_chunk = self._full_state[1]
+            self.spec = 'lookup' if full_spec != 'off' else 'off'
         c = int(chunk if chunk is not None else os.environ.get('INK_LITE_CHUNK', 1024))
         self.chunk = max(1, min(c, full_chunk))
         mb = int(margin_mb if margin_mb is not None else os.environ.get('INK_LITE_MARGIN_MB', 512))
@@ -516,19 +523,28 @@ class Engine:
         return self.lite_status()
 
     def exit_lite(self):
-        """Leave light mode: reload all offloaded routed experts onto the device and rebuild full-mode decoder/config.
-        On CUDA OOM mid-reload or decoder rebuild, rolls back to light mode and re-raises."""
+        """Leave light mode: drop lite decoder (releasing DecodeState VRAM & any cached expert refs), reload all
+        offloaded routed experts onto the device, and rebuild full-mode decoder/config. On CUDA OOM mid-reload or
+        decoder rebuild, rolls back to light mode and re-raises."""
         if not getattr(self, 'lite', False):
             return self.lite_status()
         assert not self.bd.busy(), 'cannot exit light mode while decode slots are busy'
         keep_layers = set(range(6, 6 + self.lite_keep_core))
         ram_layers = self._lite_ram_layers(getattr(self, 'lite_ram_experts', 'mmap'), keep_layers)
-        self.model.W.reload_experts()
-        bd_spec, chunk, spec, margin = self._full_state
+        use_fused = isinstance(self.bd, LoopBatch) and self.bd.dec
+        self.bd.drop()
+        self.bd = SeqBatch(self.model, 1, taps=False)
+        gc.collect()
+        if self.model.dev.type == 'cuda':
+            torch.cuda.empty_cache()
         try:
+            self.model.W.reload_experts()
+            bd_spec, chunk, spec, margin = self._full_state
             new_bd = self._build_bd(bd_spec)
         except torch.OutOfMemoryError:
             self.model.W.offload_experts(keep_layers, ram_layers=ram_layers)
+            if use_fused:
+                self.bd = LoopBatch(self.model, 1, dec=True, graph=False, fuse=True)
             gc.collect()
             if self.model.dev.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -556,6 +572,9 @@ class Engine:
             'offloaded_layers': len(getattr(self.model.W, 'offloaded', ())),
             'ram_experts': getattr(self, 'lite_ram_experts', 'mmap'),
             'ram_layers': len(getattr(self.model.W, 'ram_layers', ())),
+            'pinned_layers': len(getattr(self.model.W, 'pinned_layers', ())),
+            'decoder': 'fused' if isinstance(self.bd, LoopBatch) and self.bd.dec else
+                       'seq' if isinstance(self.bd, SeqBatch) else 'batch',
             'slots': self.slots,
             'chunk': self.chunk,
             'spec': self.spec,
